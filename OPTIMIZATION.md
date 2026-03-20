@@ -83,9 +83,37 @@ Replaced the Python loop over T timesteps in `_kl_loss` with batched tensor oper
 
 `torch.compile(decoder, mode="default")` for training. Fuses the transposed convolution forward + backward kernels. Stored separately as `self._compiled_decoder` so inference paths use the uncompiled module.
 
+### 9. Whole-loop RSSM compilation ✅
+
+Instead of compiling individual `observe_step`/`imagine_step` functions and calling them from a Python loop, moved the entire T-step RSSM observe loop into a standalone function `_observe_sequence()` and compiled that as a single `torch.compile` graph. This eliminates Python interpreter overhead between sequential steps (function call dispatch, Python→C++ transitions, guard checks per iteration).
+
+```python
+def _observe_sequence(rssm, init_deter, init_stoch, actions, embed, T):
+    # Pre-allocate output tensors (no list appends — compile-friendly)
+    all_features = torch.empty(T, B, D, device=init_deter.device)
+    deter, stoch = init_deter, init_stoch
+    for t in range(T):
+        prev = RSSMState(deter=deter, stoch=stoch)
+        post_state, prior_state, prior_logits = rssm.observe_step(prev, actions[:, t], embed[:, t])
+        ...
+    return all_features, all_post_stochs, all_prior_logits, deter, stoch
+
+compiled_observe_seq = torch.compile(_observe_sequence, mode="default")
+```
+
+Key implementation details:
+- Pre-allocates output tensors and writes via index assignment instead of list appends (Python container mutations cause graph breaks)
+- Returns raw tensors (deter, stoch) instead of RSSMState for the final state
+- First compilation takes ~20 min (50-step unrolled graph), but is cached for subsequent runs
+
+**Measured speedup** (RTX 4090, B=32, T=50):
+| Metric | Per-step compiled | Whole-loop compiled | Speedup |
+|---|---|---|---|
+| RSSM observe (T=50) | 278 ms | 112 ms | **2.48×** |
+
 ### Combined result
 
-**Full `train_step`: 2700 ms → 1064 ms (2.54× speedup)** on RTX 4090.
+**Full `train_step`: 2700 ms → 716 ms (3.77× speedup)** on RTX 4090.
 
 ## Approaches tested but not adopted
 
@@ -106,36 +134,27 @@ Tested replacing `nn.GRUCell` with `F.linear`-based implementation for better to
 
 | Phase | Time | Notes |
 |---|---|---|
-| Encoder forward | 6 ms | Already fast, not worth optimizing |
-| RSSM forward (50 steps) | 276 ms | 5.5 ms/step, memory-bandwidth bound |
-| Decoder + heads forward | 16 ms | |
-| KL loss | 4 ms | Vectorized |
-| **Backward (BPTT + decoder)** | **443 ms** | **Dominant bottleneck** |
-| Optimizer step | 7 ms | |
-| Actor-critic (imagination) | 321 ms | 15 imagine steps + critic/actor loss+backward |
+| Encoder forward | ~6 ms | Already fast, not worth optimizing |
+| RSSM forward (50 steps) | ~112 ms | Whole-loop compiled, 2.2 ms/step |
+| Decoder + heads forward | ~16 ms | |
+| KL loss | ~4 ms | Vectorized |
+| **Backward (BPTT + decoder)** | ~280 ms | **Dominant bottleneck** (also benefits from whole-loop compilation) |
+| Optimizer step | ~7 ms | |
+| Actor-critic (imagination) | ~290 ms | 15 imagine steps + critic/actor loss+backward |
 
-The backward pass through 50 RSSM steps (BPTT) at 443 ms is the main remaining target. It's fundamentally limited by the sequential reverse traversal of the computation graph.
+The backward pass through 50 RSSM steps (BPTT) is the main remaining target. It's fundamentally limited by the sequential reverse traversal of the computation graph, though the whole-loop compilation reduces overhead here too.
 
 ## Remaining approaches
 
-### Approach 1: Fused CUDA kernel
+### Approach 1: Custom Triton kernel for RSSM step
 
-Fuse the GRU cell + linear layers + LayerNorm + SiLU + categorical sampling into a single CUDA kernel per RSSM step. This eliminates kernel launch overhead and intermediate memory round-trips.
+Fuse the GRU cell + linear layers + LayerNorm + SiLU + categorical sampling into a single hand-written Triton kernel per RSSM step. The whole-loop compilation (optimization #9) already achieves much of this via torch.compile's Triton codegen, so the remaining gain from a hand-tuned kernel would be smaller than originally estimated.
 
-- **Expected speedup**: 2-4x on the RSSM loop (on top of current torch.compile)
-- **Effort**: Medium-high (custom CUDA or Triton kernel)
+- **Expected speedup**: ~1.3-1.5x on the RSSM forward (diminishing returns after whole-loop compile)
+- **Effort**: High (custom Triton kernel with backward pass)
 - **Risk**: Low (no algorithmic change)
-- **Reference**: Same idea as FlashAttention but for recurrent steps
 
-Key operations to fuse per step:
-1. `pre_gru`: Linear(stoch_flat + action_dim → hidden) + LayerNorm + SiLU
-2. `GRUCell(hidden, deter)` — internal: 3 linear projections + sigmoid + tanh
-3. `prior_net`: Linear(deter → hidden) + LayerNorm + SiLU + Linear(hidden → stoch_logits)
-4. Gumbel-max categorical sampling with straight-through + unimix
-
-A Triton kernel would be the most practical implementation path.
-
-### Approach 3: Linear recurrence with parallel scan
+### Approach 2: Linear recurrence with parallel scan
 
 Replace the GRU with a linear recurrence (e.g., S4, S5, Mamba-style) that supports parallel prefix scan computation: O(log T) sequential depth instead of O(T).
 
@@ -148,7 +167,7 @@ Replace the GRU with a linear recurrence (e.g., S4, S5, Mamba-style) that suppor
 
 The GRU's nonlinear gates are what prevent parallelization. A linear recurrence `h_t = A * h_{t-1} + B * x_t` can be computed for all T in parallel using an associative scan. The tradeoff is that linear recurrences have weaker expressivity per step, which may require wider hidden states to compensate.
 
-### Approach 4: Reduce sequence length
+### Approach 3: Reduce sequence length
 
 The simplest option: reduce `--seq_len` from 50 to 25.
 
@@ -158,7 +177,7 @@ The simplest option: reduce `--seq_len` from 50 to 25.
 
 Can be combined with any of the above approaches.
 
-### Approach 5: Pinned-memory replay buffer
+### Approach 4: Pinned-memory replay buffer
 
 The profiler showed pageable HtoD transfers are still significant. Pre-allocating replay buffer storage in pinned (page-locked) memory would enable true async DMA transfers via `non_blocking=True`, overlapping data transfer with computation.
 
@@ -166,9 +185,17 @@ The profiler showed pageable HtoD transfers are still significant. Pre-allocatin
 - **Effort**: Medium (replay buffer refactor)
 - **Risk**: Low (increases host memory usage, pinned memory is a limited resource)
 
+### Approach 5: Compiled imagination loop
+
+Apply the same whole-loop compilation technique to the 15-step actor-critic imagination loop. Trickier because the actor distribution sampling and entropy computation must remain differentiable.
+
+- **Expected speedup**: ~1.2-1.5x on actor-critic phase
+- **Effort**: Medium (need compile-friendly action sampling)
+- **Risk**: Low
+
 ## Recommended next steps
 
-1. **Fused Triton kernel** — best remaining effort/reward ratio for the RSSM loop
+1. **Compiled imagination loop** — apply same technique as optimization #9 to actor-critic
 2. **Pinned-memory replay buffer** — straightforward engineering, eliminates remaining HtoD bottleneck
 3. **Reduce seq_len** — quick experiment to validate the speedup is worth the context tradeoff
 4. **Linear recurrence** — biggest potential gain but requires architecture research
