@@ -111,9 +111,24 @@ Key implementation details:
 |---|---|---|---|
 | RSSM observe (T=50) | 278 ms | 112 ms | **2.48×** |
 
+### 10. Whole-loop imagination compilation ✅
+
+Same technique as #9, applied to the 15-step actor-critic imagination loop. The actor's `OneHotCategorical.sample()` causes torch.compile graph breaks, so replaced with Gumbel-max sampling inside the compiled function. Log-prob and entropy are recomputed outside the compiled loop for the actor loss (these only need features and actions, not the sequential state).
+
+```python
+def _imagine_sequence(rssm, actor_net, init_deter, init_stoch, horizon, action_dim):
+    for t in range(horizon):
+        action_logits = actor_net(features)
+        # Gumbel-max sampling (compile-friendly)
+        u = torch.zeros_like(action_logits).uniform_().clamp_(1e-20, 1 - 1e-7)
+        action = F.one_hot((action_logits + gumbel).argmax(-1), action_dim)
+        next_state = rssm.imagine_step(state, action)
+        ...
+```
+
 ### Combined result
 
-**Full `train_step`: 2700 ms → 716 ms (3.77× speedup)** on RTX 4090.
+**Full `train_step`: 2700 ms → 531 ms (5.08× speedup)** on RTX 4090.
 
 ## Approaches tested but not adopted
 
@@ -134,15 +149,15 @@ Tested replacing `nn.GRUCell` with `F.linear`-based implementation for better to
 
 | Phase | Time | Notes |
 |---|---|---|
-| Encoder forward | ~6 ms | Already fast, not worth optimizing |
-| RSSM forward (50 steps) | ~112 ms | Whole-loop compiled, 2.2 ms/step |
+| Encoder forward | ~6 ms | Already fast |
+| RSSM forward (50 steps) | ~112 ms | Whole-loop compiled |
 | Decoder + heads forward | ~16 ms | |
 | KL loss | ~4 ms | Vectorized |
-| **Backward (BPTT + decoder)** | ~280 ms | **Dominant bottleneck** (also benefits from whole-loop compilation) |
+| **Backward (BPTT + decoder)** | ~200 ms | **Dominant bottleneck** |
 | Optimizer step | ~7 ms | |
-| Actor-critic (imagination) | ~290 ms | 15 imagine steps + critic/actor loss+backward |
+| Actor-critic (imagination) | ~185 ms | Whole-loop compiled (15 imagine + actor + critic) |
 
-The backward pass through 50 RSSM steps (BPTT) is the main remaining target. It's fundamentally limited by the sequential reverse traversal of the computation graph, though the whole-loop compilation reduces overhead here too.
+The backward pass through 50 RSSM steps (BPTT) is the main remaining target. It's fundamentally limited by the sequential reverse traversal of the computation graph.
 
 ## Remaining approaches
 
@@ -185,17 +200,8 @@ The profiler showed pageable HtoD transfers are still significant. Pre-allocatin
 - **Effort**: Medium (replay buffer refactor)
 - **Risk**: Low (increases host memory usage, pinned memory is a limited resource)
 
-### Approach 5: Compiled imagination loop
-
-Apply the same whole-loop compilation technique to the 15-step actor-critic imagination loop. Trickier because the actor distribution sampling and entropy computation must remain differentiable.
-
-- **Expected speedup**: ~1.2-1.5x on actor-critic phase
-- **Effort**: Medium (need compile-friendly action sampling)
-- **Risk**: Low
-
 ## Recommended next steps
 
-1. **Compiled imagination loop** — apply same technique as optimization #9 to actor-critic
-2. **Pinned-memory replay buffer** — straightforward engineering, eliminates remaining HtoD bottleneck
-3. **Reduce seq_len** — quick experiment to validate the speedup is worth the context tradeoff
-4. **Linear recurrence** — biggest potential gain but requires architecture research
+1. **Pinned-memory replay buffer** — straightforward engineering, eliminates remaining HtoD bottleneck
+2. **Reduce seq_len** — quick experiment to validate the speedup is worth the context tradeoff
+3. **Linear recurrence** — biggest potential gain but requires architecture research
