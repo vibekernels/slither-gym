@@ -72,10 +72,20 @@ class GameState:
         for snake in self.snakes:
             if not snake.alive:
                 continue
-            speed = self.config.boost_speed if snake.boosting else self.config.base_speed
-            snake.move(speed)
-            if snake.boosting and snake.length > 5:
-                snake.shrink(self.config.boost_mass_cost)
+            if snake.boosting and snake.length > self.config.initial_length:
+                # Boost: take 2 sub-steps at base speed to maintain segment spacing
+                # but move twice as far overall
+                for _ in range(2):
+                    snake.move(self.config.base_speed)
+                # Accumulate fractional boost cost; drop pellet when a full segment is lost
+                snake._boost_debt += self.config.boost_mass_cost
+                if snake._boost_debt >= 1.0:
+                    tail_pos = snake.positions[snake.tail_idx].copy()
+                    self.food.spawn_boost_pellet(tail_pos)
+                    snake.shrink(1)
+                    snake._boost_debt -= 1.0
+            else:
+                snake.move(self.config.base_speed)
 
         # Food eating
         for snake in self.snakes:
@@ -100,18 +110,23 @@ class GameState:
         return self.events
 
     def _apply_player_action(self, action: int):
-        """Discrete(3): 0=straight, 1=left, 2=right."""
+        """Discrete(6): 0=straight, 1=left, 2=right, 3=boost straight, 4=boost left, 5=boost right."""
         player = self.player
         if not player.alive:
             return
-        if action == 1:
-            player.turn(-1.0, self.config.turn_rate)
-        elif action == 2:
-            player.turn(1.0, self.config.turn_rate)
-        # action == 0 is straight (no turn)
 
-        player.boosting = False
-        self.events["boosting"] = False
+        turn_action = action % 3
+        wants_boost = action >= 3
+
+        if turn_action == 1:
+            player.turn(-1.0, self.config.turn_rate)
+        elif turn_action == 2:
+            player.turn(1.0, self.config.turn_rate)
+
+        # Boost only if snake is long enough
+        min_boost_length = self.config.initial_length
+        player.boosting = wants_boost and player.length > min_boost_length
+        self.events["boosting"] = player.boosting
 
     def _step_npcs(self):
         """Simple NPC behavior: wander + eat, gently steer toward nearby food."""
@@ -128,6 +143,7 @@ class GameState:
                 dists_sq = np.sum(diffs * diffs, axis=1)
                 nearest_idx = np.argmin(dists_sq)
                 target = active_food[nearest_idx]
+                nearest_dist_sq = dists_sq[nearest_idx]
 
                 # Desired angle to target
                 desired = np.arctan2(
@@ -138,6 +154,12 @@ class GameState:
                 diff = (desired - snake.direction + np.pi) % (2 * np.pi) - np.pi
                 turn_amount = np.clip(diff / self.config.turn_rate, -1.0, 1.0)
                 snake.turn(turn_amount, self.config.turn_rate)
+
+                # Occasionally boost toward nearby food clusters or when chasing
+                if (snake.length > self.config.initial_length + 5
+                        and nearest_dist_sq < 60.0 ** 2
+                        and self.rng.random() < 0.3):
+                    snake.boosting = True
             else:
                 # Random wander
                 snake.turn(self.rng.uniform(-0.3, 0.3), self.config.turn_rate)

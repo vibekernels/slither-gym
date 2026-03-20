@@ -27,6 +27,7 @@ class Snake:
         self.boosting = False
         self.score = 0.0
         self.respawn_timer = 0
+        self._boost_debt = 0.0  # fractional boost cost accumulator
 
         # Initialize segments trailing behind the head
         dx = -np.cos(direction) * segment_spacing

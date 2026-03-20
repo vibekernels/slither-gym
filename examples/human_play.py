@@ -3,6 +3,7 @@
 Controls:
     Left Arrow  / A  — turn left
     Right Arrow / D  — turn right
+    Up Arrow    / W  — boost (costs length)
     (no key)         — go straight
     R                — restart after death
     ESC / Q          — quit
@@ -47,10 +48,13 @@ def main():
             break
 
         keys = pygame.key.get_pressed()
+        boosting = keys[pygame.K_UP] or keys[pygame.K_w]
         if keys[pygame.K_LEFT] or keys[pygame.K_a]:
             action = 1
         elif keys[pygame.K_RIGHT] or keys[pygame.K_d]:
             action = 2
+        if boosting:
+            action += 3  # 3=boost straight, 4=boost left, 5=boost right
 
         obs, reward, terminated, truncated, info = env.step(action)
         total_reward += reward

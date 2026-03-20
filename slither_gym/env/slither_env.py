@@ -17,7 +17,7 @@ class SlitherEnv(gym.Env):
     A slither.io Gymnasium environment suitable for DreamerV3 training.
 
     Observation: (obs_size, obs_size, 3) uint8 RGB image, ego-centric view.
-    Action: Discrete(3) — 0=straight, 1=turn left, 2=turn right.
+    Action: Discrete(6) — 0=straight, 1=left, 2=right, 3=boost straight, 4=boost left, 5=boost right.
     """
 
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 30}
@@ -50,7 +50,7 @@ class SlitherEnv(gym.Env):
         self.observation_space = spaces.Box(
             low=0, high=255, shape=(obs_size, obs_size, 3), dtype=np.uint8
         )
-        self.action_space = spaces.Discrete(3)
+        self.action_space = spaces.Discrete(6)
 
         # Will be initialized on reset
         self._state: GameState | None = None

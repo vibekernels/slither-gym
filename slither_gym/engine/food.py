@@ -43,26 +43,45 @@ class FoodManager:
         self.colors[slots] = self.rng.integers(128, 256, size=(count, 3), dtype=np.uint8)
 
     def spawn_death_food(self, positions: np.ndarray, fraction: float):
-        """Scatter food where a snake died."""
+        """Scatter food along the snake's body where it died, like slither.io."""
         n = max(1, int(len(positions) * fraction))
         n = min(n, len(positions))
         inactive = np.where(~self.active)[0]
         count = min(n, len(inactive))
         if count == 0:
             return
-        # Pick a subset of snake segment positions
+        # Pick evenly spaced segment positions along the body
         indices = np.linspace(0, len(positions) - 1, count, dtype=int)
         slots = inactive[:count]
         self.positions[slots] = positions[indices]
-        # Jitter slightly
-        self.positions[slots] += self.rng.normal(0, 3, size=(count, 2)).astype(np.float32)
+        # Small jitter to spread pellets slightly around the body line
+        self.positions[slots] += self.rng.normal(0, 1.5, size=(count, 2)).astype(np.float32)
         self.values[slots] = self.config.food_value * 2  # death food is richer
         self.active[slots] = True
-        self.colors[slots] = self.rng.integers(180, 256, size=(count, 3), dtype=np.uint8)
+        # Use a consistent bright color per snake death (like slither.io)
+        base_color = self.rng.integers(180, 256, size=(1, 3), dtype=np.uint8)
+        # Slight per-pellet variation
+        variation = self.rng.integers(-20, 20, size=(count, 3), dtype=np.int16)
+        self.colors[slots] = np.clip(
+            base_color.astype(np.int16) + variation, 128, 255
+        ).astype(np.uint8)
+
+    def spawn_boost_pellet(self, position: np.ndarray):
+        """Spawn a single food pellet at the given position (from boosting)."""
+        inactive = np.where(~self.active)[0]
+        if len(inactive) == 0:
+            return
+        slot = inactive[0]
+        self.positions[slot] = position
+        self.values[slot] = self.config.food_value
+        self.active[slot] = True
+        self.colors[slot] = self.rng.integers(180, 256, size=3, dtype=np.uint8)
 
     def step(self):
-        """Respawn food each step to maintain density."""
-        self._spawn_n(self.config.food_respawn_rate)
+        """Respawn food each step, but cap at initial_food to leave room for boost/death pellets."""
+        current = int(np.sum(self.active))
+        if current < self.config.initial_food:
+            self._spawn_n(min(self.config.food_respawn_rate, self.config.initial_food - current))
 
     def check_eat(self, head_pos: np.ndarray, eat_radius: float) -> float:
         """Check if head_pos eats any food. Returns total value eaten."""

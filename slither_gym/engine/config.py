@@ -15,15 +15,15 @@ class GameConfig:
     segment_spacing: float = 4.0     # distance between segments
     head_radius: float = 6.0
     body_radius: float = 5.0
-    boost_mass_cost: float = 0.5     # length lost per step while boosting
+    boost_mass_cost: float = 0.2     # length lost per step while boosting
 
     # Food
-    max_food: int = 300
+    max_food: int = 600
     food_radius: float = 4.0
     food_value: float = 1.0          # length gained per food
     initial_food: int = 200
     food_respawn_rate: int = 3       # new food per step (up to max)
-    death_food_fraction: float = 0.6 # fraction of length dropped as food on death
+    death_food_fraction: float = 0.8 # fraction of length dropped as food on death
 
     # NPCs
     num_npcs: int = 4
