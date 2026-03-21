@@ -229,6 +229,8 @@ def main():
     parser.add_argument("--no_amp", action="store_true", help="Disable mixed precision")
     parser.add_argument("--num_envs", type=int, default=4, help="Number of parallel envs for collection")
     parser.add_argument("--no_async", action="store_true", help="Disable async collection (use single env)")
+    parser.add_argument("--rssm_type", type=str, default="gru", choices=["gru", "mamba"],
+                        help="RSSM type: gru (default) or mamba (selective SSM)")
     args = parser.parse_args()
 
     # Setup
@@ -255,6 +257,7 @@ def main():
         device=args.device,
         use_amp=not args.no_amp,
         compile_models=False,  # disabled: incompatible with multi-thread inference
+        rssm_type=args.rssm_type,
     )
 
     if args.resume:

@@ -8,7 +8,7 @@ import torch.nn.functional as F
 import numpy as np
 
 from .networks import (
-    WorldModel, Actor, Critic, RSSMState,
+    WorldModel, Actor, Critic, RSSMState, MambaRSSM,
     symlog, symexp, twohot_encode, twohot_decode,
 )
 
@@ -18,6 +18,7 @@ def _imagine_sequence(rssm, actor_net, init_deter, init_stoch, horizon, action_d
 
     Uses Gumbel-max sampling for actions (compile-friendly). Log-prob and entropy
     are recomputed outside this function for the actor loss.
+    Works for both GRU and Mamba RSSM via rssm.get_features/imagine_step.
     """
     B = init_deter.shape[0]
     D = rssm.state_dim
@@ -25,15 +26,12 @@ def _imagine_sequence(rssm, actor_net, init_deter, init_stoch, horizon, action_d
     all_features = torch.empty(horizon + 1, B, D, device=init_deter.device)
     all_actions = torch.empty(horizon, B, action_dim, device=init_deter.device)
 
-    deter, stoch = init_deter, init_stoch
-    stoch_flat = stoch.reshape(B, -1)
-    all_features[0] = torch.cat([deter, stoch_flat], dim=-1)
+    state = RSSMState(deter=init_deter, stoch=init_stoch)
+    all_features[0] = rssm.get_features(state)
 
     for t in range(horizon):
         features = all_features[t]
-        # Actor forward (just the MLP, no distribution object)
         action_logits = actor_net(features)
-        # Gumbel-max sampling (equivalent to OneHotCategorical.sample())
         u = torch.zeros_like(action_logits).uniform_().clamp_(1e-20, 1 - 1e-7)
         gumbel = -(-u.log()).log()
         action = F.one_hot(
@@ -41,13 +39,15 @@ def _imagine_sequence(rssm, actor_net, init_deter, init_stoch, horizon, action_d
         ).to(action_logits.dtype)
         all_actions[t] = action
 
-        state = RSSMState(deter=deter, stoch=stoch)
-        next_state = rssm.imagine_step(state, action)
-        deter, stoch = next_state.deter, next_state.stoch
-        stoch_flat = stoch.reshape(B, -1)
-        all_features[t + 1] = torch.cat([deter, stoch_flat], dim=-1)
+        state = rssm.imagine_step(state, action)
+        all_features[t + 1] = rssm.get_features(state)
 
     return all_features, all_actions
+
+
+def _mamba_observe_wrapper(rssm, actions, embed):
+    """Wrapper for MambaRSSM.observe_sequence (standalone for torch.compile)."""
+    return rssm.observe_sequence(actions, embed)
 
 
 def _observe_sequence(rssm, init_deter, init_stoch, actions, embed, T):
@@ -108,12 +108,14 @@ class DreamerV3Agent:
         kl_scale: float = 0.5,
         use_amp: bool = True,
         compile_models: bool = True,
+        rssm_type: str = "gru",
     ):
         # TF32 gives ~1.5x matmul speedup on Ampere+ GPUs with negligible precision loss
         torch.set_float32_matmul_precision("high")
 
         self.device = torch.device(device)
         self.action_dim = action_dim
+        self.rssm_type = rssm_type
         self.imagine_horizon = imagine_horizon
         self.gamma = gamma
         self.lambda_ = lambda_
@@ -136,6 +138,7 @@ class DreamerV3Agent:
             hidden_dim=hidden_dim,
             cnn_depth=cnn_depth,
             reward_bins=reward_bins,
+            rssm_type=rssm_type,
         ).to(self.device)
 
         state_dim = self.world_model.state_dim
@@ -155,19 +158,31 @@ class DreamerV3Agent:
         # Compiled RSSM sequence functions.
         # Compiling the entire loop as one graph eliminates Python loop overhead
         # between steps (~2.2x speedup on RSSM forward vs per-step compilation).
+        self._use_mamba = rssm_type == "mamba"
         if self.device.type == "cuda":
             try:
-                self._compiled_observe_seq = torch.compile(
-                    _observe_sequence, mode="default"
-                )
+                if self._use_mamba:
+                    self._compiled_observe_seq = torch.compile(
+                        _mamba_observe_wrapper, mode="default"
+                    )
+                else:
+                    self._compiled_observe_seq = torch.compile(
+                        _observe_sequence, mode="default"
+                    )
                 self._compiled_imagine_seq = torch.compile(
                     _imagine_sequence, mode="default"
                 )
             except Exception:
-                self._compiled_observe_seq = _observe_sequence
+                if self._use_mamba:
+                    self._compiled_observe_seq = _mamba_observe_wrapper
+                else:
+                    self._compiled_observe_seq = _observe_sequence
                 self._compiled_imagine_seq = _imagine_sequence
         else:
-            self._compiled_observe_seq = _observe_sequence
+            if self._use_mamba:
+                self._compiled_observe_seq = _mamba_observe_wrapper
+            else:
+                self._compiled_observe_seq = _observe_sequence
             self._compiled_imagine_seq = _imagine_sequence
 
         # Compile decoder for training (fuses forward + backward convolution kernels).
@@ -303,20 +318,34 @@ class DreamerV3Agent:
 
         # Run RSSM forward (fp32 — at B=32, dim=512 ops are memory-bandwidth bound,
         # so bfloat16 tensor cores don't help and the manual GRU adds kernel overhead).
-        # Entire T-step loop compiled as single graph to eliminate Python overhead.
         embed_f32 = embed.float()
-        init_state = self.world_model.rssm.initial_state(B, self.device)
+        rssm = self.world_model.rssm
 
-        all_features, all_post_stochs, all_prior_logits, final_deter, final_stoch = \
-            self._compiled_observe_seq(
-                self.world_model.rssm, init_state.deter, init_state.stoch,
-                actions, embed_f32, T
+        if self._use_mamba:
+            # Mamba: parallel scan over all T steps (no stochastic feedback)
+            all_features, all_post_stochs, all_prior_logits, \
+                final_deter, final_stoch, final_ssm_h = \
+                self._compiled_observe_seq(rssm, actions, embed_f32)
+            # Pack ssm_h into deter for imagination starting state
+            packed_deter = torch.cat(
+                [final_deter, final_ssm_h.reshape(B, -1)], dim=-1
+            )
+            self._train_state_cache = RSSMState(
+                deter=packed_deter.detach(), stoch=final_stoch.detach()
+            )
+        else:
+            # GRU: compiled sequential loop
+            init_state = rssm.initial_state(B, self.device)
+            all_features, all_post_stochs, all_prior_logits, \
+                final_deter, final_stoch = \
+                self._compiled_observe_seq(
+                    rssm, init_state.deter, init_state.stoch,
+                    actions, embed_f32, T
+                )
+            self._train_state_cache = RSSMState(
+                deter=final_deter.detach(), stoch=final_stoch.detach()
             )
 
-        # Cache final posterior state (detached) for actor-critic imagination starting state.
-        self._train_state_cache = RSSMState(
-            deter=final_deter.detach(), stoch=final_stoch.detach()
-        )
         features = all_features.permute(1, 0, 2)  # (T, B, D) -> (B, T, D)
 
         with torch.amp.autocast(self.device.type, dtype=self.amp_dtype, enabled=self.use_amp):
@@ -387,12 +416,20 @@ class DreamerV3Agent:
                     embed_flat = self.world_model.encoder(obs_flat)
                 embed = embed_flat.float().reshape(B, T, -1)
 
-                init_state = self.world_model.rssm.initial_state(B, self.device)
-                _, _, _, final_d, final_s = self._compiled_observe_seq(
-                    self.world_model.rssm, init_state.deter, init_state.stoch,
-                    actions, embed, T
-                )
-                state = RSSMState(deter=final_d.detach(), stoch=final_s.detach())
+                rssm = self.world_model.rssm
+                if self._use_mamba:
+                    _, _, _, final_d, final_s, final_h = self._compiled_observe_seq(
+                        rssm, actions, embed
+                    )
+                    packed = torch.cat([final_d, final_h.reshape(B, -1)], dim=-1)
+                    state = RSSMState(deter=packed.detach(), stoch=final_s.detach())
+                else:
+                    init_state = rssm.initial_state(B, self.device)
+                    _, _, _, final_d, final_s = self._compiled_observe_seq(
+                        rssm, init_state.deter, init_state.stoch,
+                        actions, embed, T
+                    )
+                    state = RSSMState(deter=final_d.detach(), stoch=final_s.detach())
 
         # Imagine forward — actor learns through differentiable world model dynamics.
         # Entire H-step loop compiled as single graph (same technique as observe).

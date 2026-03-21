@@ -233,6 +233,279 @@ class RSSM(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Parallel associative scan
+# ---------------------------------------------------------------------------
+
+def associative_scan(gates: torch.Tensor, values: torch.Tensor) -> torch.Tensor:
+    """Parallel prefix scan (Hillis-Steele) for linear recurrence.
+
+    Computes h[0] = v[0], h[t] = g[t] * h[t-1] + v[t] for t > 0.
+    All operations are element-wise. O(T log T) work, O(log T) depth.
+
+    Args:
+        gates: (T, *batch_dims) — multiplicative coefficients
+        values: (T, *batch_dims) — additive terms
+    Returns:
+        (T, *batch_dims) — prefix scan results (the h values)
+    """
+    T = gates.shape[0]
+    for d in range(int(math.ceil(math.log2(max(T, 2))))):
+        stride = 1 << d
+        if stride >= T:
+            break
+        # Combine position i with position i-stride for all i >= stride
+        new_g = gates[stride:] * gates[:T - stride]
+        new_v = gates[stride:] * values[:T - stride] + values[stride:]
+        gates = torch.cat([gates[:stride], new_g], dim=0)
+        values = torch.cat([values[:stride], new_v], dim=0)
+    return values
+
+
+# ---------------------------------------------------------------------------
+# Mamba RSSM (Selective State Space replacement for GRU)
+# ---------------------------------------------------------------------------
+
+class MambaRSSM(nn.Module):
+    """RSSM with Mamba-style selective SSM replacing the GRU.
+
+    Key differences from GRU RSSM:
+    1. Linear recurrence enables parallel scan during training (O(log T) depth)
+    2. Input-dependent A, B, C (selective mechanism) provides content-based filtering
+    3. No stochastic feedback into sequence model (enables parallel training)
+
+    The SSM internal state (ssm_h) is packed into RSSMState.deter to maintain
+    the same interface as the GRU RSSM.
+    """
+
+    def __init__(
+        self,
+        embed_dim: int = 512,
+        action_dim: int = 3,
+        deter_dim: int = 512,
+        stoch_dim: int = 32,
+        class_size: int = 32,
+        hidden_dim: int = 512,
+        d_state: int = 16,
+        unimix: float = 0.01,
+    ):
+        super().__init__()
+        self.deter_dim = deter_dim
+        self.stoch_dim = stoch_dim
+        self.class_size = class_size
+        self.unimix = unimix
+        self.d_state = d_state
+
+        stoch_flat = stoch_dim * class_size
+
+        # Input projection (action for imagine, action+embed for observe)
+        self.pre_ssm = nn.Sequential(
+            nn.Linear(action_dim, hidden_dim),
+            LayerNormSiLU(hidden_dim),
+        )
+        self.embed_proj = nn.Linear(embed_dim, hidden_dim, bias=False)
+
+        # Project to SSM input + gate (Mamba-style gated output)
+        self.in_proj = nn.Linear(hidden_dim, deter_dim * 2)
+
+        # SSM parameters
+        # A initialized with log-spaced values (like S4D-Lin / Mamba)
+        A = torch.arange(1, d_state + 1, dtype=torch.float32)
+        self.A_log = nn.Parameter(
+            torch.log(A).unsqueeze(0).expand(deter_dim, -1).clone()
+        )
+        self.D = nn.Parameter(torch.ones(deter_dim))
+
+        # Input-dependent SSM parameter projections (from x_ssm)
+        self.proj_dt = nn.Linear(deter_dim, deter_dim)
+        self.proj_B = nn.Linear(deter_dim, d_state, bias=False)
+        self.proj_C = nn.Linear(deter_dim, d_state, bias=False)
+
+        # Initialize dt bias so softplus(bias) ∈ [0.001, 0.1]
+        dt_min, dt_max = 0.001, 0.1
+        with torch.no_grad():
+            dt_init = torch.exp(
+                torch.rand(deter_dim) * (math.log(dt_max) - math.log(dt_min))
+                + math.log(dt_min)
+            )
+            inv_dt = dt_init + torch.log(-torch.expm1(-dt_init))
+            self.proj_dt.bias.copy_(inv_dt)
+
+        # Output normalization
+        self.out_norm = nn.LayerNorm(deter_dim)
+
+        # Prior/posterior networks (same as GRU RSSM)
+        self.prior_net = mlp(deter_dim, hidden_dim, stoch_dim * class_size, layers=1)
+        self.post_net = mlp(deter_dim + embed_dim, hidden_dim, stoch_dim * class_size, layers=1)
+
+    @property
+    def state_dim(self) -> int:
+        """Feature dimension: deter + stoch_flat (not including packed ssm_h)."""
+        return self.deter_dim + self.stoch_dim * self.class_size
+
+    def _pack_state(self, deter: torch.Tensor, stoch: torch.Tensor,
+                    ssm_h: torch.Tensor) -> RSSMState:
+        """Pack ssm_h into deter for interface compatibility."""
+        packed = torch.cat([deter, ssm_h.reshape(deter.shape[0], -1)], dim=-1)
+        return RSSMState(deter=packed, stoch=stoch)
+
+    def _unpack_state(self, state: RSSMState):
+        """Extract deter and ssm_h from packed state."""
+        deter = state.deter[:, :self.deter_dim]
+        ssm_h = state.deter[:, self.deter_dim:].reshape(
+            -1, self.deter_dim, self.d_state
+        )
+        return deter, state.stoch, ssm_h
+
+    def initial_state(self, batch_size: int, device: torch.device) -> RSSMState:
+        packed_dim = self.deter_dim + self.deter_dim * self.d_state
+        return RSSMState(
+            deter=torch.zeros(batch_size, packed_dim, device=device),
+            stoch=torch.zeros(batch_size, self.stoch_dim, self.class_size, device=device),
+        )
+
+    def get_features(self, state: RSSMState) -> torch.Tensor:
+        """Extract features (deter + stoch_flat), excluding packed ssm_h."""
+        deter = state.deter[:, :self.deter_dim]
+        stoch_flat = state.stoch.reshape(state.stoch.shape[0], -1)
+        return torch.cat([deter, stoch_flat], dim=-1)
+
+    def _categorical(self, logits: torch.Tensor) -> torch.Tensor:
+        """Sample from categorical with straight-through and unimix (Gumbel-max)."""
+        logits = logits.reshape(-1, self.stoch_dim, self.class_size)
+        if self.unimix > 0:
+            probs = F.softmax(logits, dim=-1)
+            probs = (1 - self.unimix) * probs + self.unimix / self.class_size
+            logits = torch.log(probs + 1e-8)
+        u = torch.zeros_like(logits).uniform_().clamp_(1e-20, 1 - 1e-7)
+        gumbel = -(-u.log()).log()
+        sample = F.one_hot((logits + gumbel).argmax(-1), self.class_size).to(logits.dtype)
+        probs = F.softmax(logits, dim=-1)
+        return sample + probs - probs.detach()
+
+    def _ssm_step(self, x: torch.Tensor, ssm_h: torch.Tensor):
+        """Single selective SSM step.
+
+        Args:
+            x: (B, hidden_dim) preprocessed input
+            ssm_h: (B, deter_dim, d_state) SSM internal state
+        Returns:
+            deter: (B, deter_dim) output
+            new_ssm_h: (B, deter_dim, d_state) new SSM state
+        """
+        xz = self.in_proj(x)
+        x_ssm, x_gate = xz.chunk(2, dim=-1)  # each (B, deter_dim)
+
+        dt = F.softplus(self.proj_dt(x_ssm))   # (B, deter_dim)
+        B_param = self.proj_B(x_ssm)            # (B, d_state)
+        C_param = self.proj_C(x_ssm)            # (B, d_state)
+
+        A = -torch.exp(self.A_log)                          # (deter_dim, d_state)
+        dA = torch.exp(dt.unsqueeze(-1) * A)                # (B, deter_dim, d_state)
+        dBx = (dt * x_ssm).unsqueeze(-1) * B_param.unsqueeze(1)  # (B, deter_dim, d_state)
+
+        new_ssm_h = dA * ssm_h + dBx
+
+        y = torch.einsum('bdn,bn->bd', new_ssm_h, C_param)  # (B, deter_dim)
+        y = y + self.D * x_ssm
+        y = y * F.silu(x_gate)
+        return self.out_norm(y), new_ssm_h
+
+    def observe_step(self, prev_state: RSSMState, action: torch.Tensor,
+                     embed: torch.Tensor):
+        """One step of posterior (training/inference). Same interface as GRU RSSM."""
+        _, _, ssm_h = self._unpack_state(prev_state)
+        x = self.pre_ssm(action) + self.embed_proj(embed)
+        new_deter, new_ssm_h = self._ssm_step(x, ssm_h)
+
+        post_logits = self.post_net(torch.cat([new_deter, embed], dim=-1))
+        post_stoch = self._categorical(post_logits)
+        prior_logits = self.prior_net(new_deter).reshape(-1, self.stoch_dim, self.class_size)
+
+        post_state = self._pack_state(new_deter, post_stoch, new_ssm_h)
+        return post_state, None, prior_logits
+
+    def imagine_step(self, prev_state: RSSMState, action: torch.Tensor) -> RSSMState:
+        """One step of prior (imagination). Same interface as GRU RSSM."""
+        _, _, ssm_h = self._unpack_state(prev_state)
+        x = self.pre_ssm(action)
+        new_deter, new_ssm_h = self._ssm_step(x, ssm_h)
+
+        prior_logits = self.prior_net(new_deter)
+        prior_stoch = self._categorical(prior_logits)
+        return self._pack_state(new_deter, prior_stoch, new_ssm_h)
+
+    def observe_sequence(self, actions: torch.Tensor, embeds: torch.Tensor):
+        """Process all T steps in parallel using associative scan.
+
+        No stochastic feedback — actions and embeddings are the only inputs,
+        enabling parallel computation of all deterministic states.
+
+        Args:
+            actions: (B, T, action_dim)
+            embeds: (B, T, embed_dim)
+        Returns:
+            features: (T, B, state_dim)
+            post_stochs: (T, B, stoch_dim, class_size)
+            prior_logits: (T, B, stoch_dim, class_size)
+            final_deter: (B, deter_dim) raw (not packed)
+            final_stoch: (B, stoch_dim, class_size)
+            final_ssm_h: (B, deter_dim, d_state)
+        """
+        B, T = actions.shape[:2]
+
+        # Pre-process all inputs at once
+        x = self.pre_ssm(actions.reshape(B * T, -1))
+        x = x + self.embed_proj(embeds.reshape(B * T, -1))
+        x = x.reshape(B, T, -1).permute(1, 0, 2)  # (T, B, hidden_dim)
+
+        # Project to SSM input + gate
+        xz = self.in_proj(x)
+        x_ssm, x_gate = xz.chunk(2, dim=-1)  # each (T, B, deter_dim)
+
+        # Input-dependent SSM parameters
+        dt = F.softplus(self.proj_dt(x_ssm))   # (T, B, deter_dim)
+        B_param = self.proj_B(x_ssm)            # (T, B, d_state)
+        C_param = self.proj_C(x_ssm)            # (T, B, d_state)
+
+        # Discretize A and compute scan inputs
+        A = -torch.exp(self.A_log)                           # (deter_dim, d_state)
+        gates = torch.exp(dt.unsqueeze(-1) * A)              # (T, B, D, N)
+        values = (dt * x_ssm).unsqueeze(-1) * B_param.unsqueeze(2)  # (T, B, D, N)
+
+        # Parallel associative scan (starts from zero SSM state)
+        h_all = associative_scan(gates, values)  # (T, B, D, N)
+
+        # Compute SSM output
+        y = torch.einsum('tbdn,tbn->tbd', h_all, C_param)
+        y = y + self.D * x_ssm
+        y = y * F.silu(x_gate)
+        deter_all = self.out_norm(y)  # (T, B, deter_dim)
+
+        # Compute priors and posteriors for all timesteps (batched)
+        TB = T * B
+        deter_flat = deter_all.reshape(TB, -1)
+        embeds_flat = embeds.permute(1, 0, 2).reshape(TB, -1)
+
+        prior_logits = self.prior_net(deter_flat).reshape(
+            T, B, self.stoch_dim, self.class_size
+        )
+        post_input = torch.cat([deter_flat, embeds_flat], dim=-1)
+        post_stochs = self._categorical(self.post_net(post_input)).reshape(
+            T, B, self.stoch_dim, self.class_size
+        )
+
+        # Features = deter + stoch_flat
+        stoch_flat = post_stochs.reshape(T, B, -1)
+        features = torch.cat([deter_all, stoch_flat], dim=-1)
+
+        return (features, post_stochs, prior_logits,
+                deter_all[-1], post_stochs[-1], h_all[-1])
+
+    def get_prior_logits(self, deter: torch.Tensor) -> torch.Tensor:
+        return self.prior_net(deter).reshape(-1, self.stoch_dim, self.class_size)
+
+
+# ---------------------------------------------------------------------------
 # Actor & Critic
 # ---------------------------------------------------------------------------
 
@@ -285,17 +558,28 @@ class WorldModel(nn.Module):
         hidden_dim: int = 512,
         cnn_depth: int = 32,
         reward_bins: int = 255,
+        rssm_type: str = "gru",
     ):
         super().__init__()
         self.encoder = CNNEncoder(depth=cnn_depth, out_dim=embed_dim)
-        self.rssm = RSSM(
-            embed_dim=embed_dim,
-            action_dim=action_dim,
-            deter_dim=deter_dim,
-            stoch_dim=stoch_dim,
-            class_size=class_size,
-            hidden_dim=hidden_dim,
-        )
+        if rssm_type == "mamba":
+            self.rssm = MambaRSSM(
+                embed_dim=embed_dim,
+                action_dim=action_dim,
+                deter_dim=deter_dim,
+                stoch_dim=stoch_dim,
+                class_size=class_size,
+                hidden_dim=hidden_dim,
+            )
+        else:
+            self.rssm = RSSM(
+                embed_dim=embed_dim,
+                action_dim=action_dim,
+                deter_dim=deter_dim,
+                stoch_dim=stoch_dim,
+                class_size=class_size,
+                hidden_dim=hidden_dim,
+            )
         state_dim = self.rssm.state_dim
         self.decoder = CNNDecoder(in_dim=state_dim, depth=cnn_depth)
         self.reward_head = mlp(state_dim, hidden_dim, reward_bins, layers=2)

@@ -126,9 +126,31 @@ def _imagine_sequence(rssm, actor_net, init_deter, init_stoch, horizon, action_d
         ...
 ```
 
+### 11. Mamba RSSM with parallel scan ✅ (optional via `--rssm_type mamba`)
+
+Replaced the GRU with a Mamba-style selective state space model. The linear recurrence `h_t = A_t * h_{t-1} + B_t * x_t` enables parallel prefix scan computation during training: O(log T) sequential depth instead of O(T).
+
+Key architecture changes:
+- **Selective SSM**: Input-dependent A, B, C parameters (Mamba-style content-based filtering)
+- **No stochastic feedback**: Removed stoch→sequence model feedback to enable full parallel scan. The SSM input during training is action + embedding; during imagination, just action.
+- **Parallel scan**: Hillis-Steele associative scan computes all T=50 deterministic states in O(log₂ 50) ≈ 6 parallel steps instead of 50 sequential GRU steps
+- **Gated output**: `y = SSM(x_ssm) * SiLU(x_gate)` (Mamba-style gating)
+- **Packed state**: SSM internal state (B, D, N) packed into RSSMState.deter for interface compatibility
+
+The biggest gain is in the **backward pass**: the linear recurrence backward is also parallelizable via reverse scan, eliminating the O(T) BPTT bottleneck that dominated GRU training.
+
+**Measured speedup** (RTX 4090, B=32, T=50):
+| Metric | GRU (compiled) | Mamba (compiled) | Speedup |
+|---|---|---|---|
+| train_step | 531 ms | 324 ms | **1.64×** |
+| RSSM params | 3.94M | 2.92M | 0.74× (fewer) |
+
+**Quality validation**: Requires comparison training runs (50k-100k env steps) to verify world model losses and reward curves are comparable. Use `--rssm_type mamba` to enable.
+
 ### Combined result
 
-**Full `train_step`: 2700 ms → 531 ms (5.08× speedup)** on RTX 4090.
+**Full `train_step` (GRU): 2700 ms → 531 ms (5.08× speedup)** on RTX 4090.
+**Full `train_step` (Mamba): 2700 ms → 324 ms (8.33× speedup)** on RTX 4090.
 
 ## Approaches tested but not adopted
 
@@ -151,52 +173,45 @@ Implemented uint8 obs storage in replay buffer (4x memory savings) with pinned-m
 
 ## Remaining time budget breakdown (RTX 4090, B=32, T=50)
 
+### GRU RSSM (531 ms)
+
 | Phase | Time | Notes |
 |---|---|---|
 | Encoder forward | ~6 ms | Already fast |
-| RSSM forward (50 steps) | ~112 ms | Whole-loop compiled |
+| RSSM forward (50 steps) | ~112 ms | Whole-loop compiled, sequential |
 | Decoder + heads forward | ~16 ms | |
 | KL loss | ~4 ms | Vectorized |
-| **Backward (BPTT + decoder)** | ~200 ms | **Dominant bottleneck** |
+| **Backward (BPTT + decoder)** | ~200 ms | **Dominant bottleneck** (sequential) |
 | Optimizer step | ~7 ms | |
-| Actor-critic (imagination) | ~185 ms | Whole-loop compiled (15 imagine + actor + critic) |
+| Actor-critic (imagination) | ~185 ms | Whole-loop compiled |
 
-The backward pass through 50 RSSM steps (BPTT) is the main remaining target. It's fundamentally limited by the sequential reverse traversal of the computation graph.
+### Mamba RSSM (324 ms)
+
+| Phase | Time | Notes |
+|---|---|---|
+| Encoder forward | ~6 ms | Same |
+| RSSM forward (parallel scan) | ~40 ms | O(log T) depth via associative scan |
+| Decoder + heads + priors/posts | ~20 ms | All batched (no sequential loop) |
+| KL loss | ~4 ms | Vectorized |
+| **Backward (scan + decoder)** | ~80 ms | Parallel reverse scan (not sequential BPTT) |
+| Optimizer step | ~7 ms | |
+| Actor-critic (imagination) | ~165 ms | Sequential (15 steps, actor depends on state) |
 
 ## Remaining approaches
 
-### Approach 1: Custom Triton kernel for RSSM step
+### Reduce sequence length
 
-Fuse the GRU cell + linear layers + LayerNorm + SiLU + categorical sampling into a single hand-written Triton kernel per RSSM step. The whole-loop compilation (optimization #9) already achieves much of this via torch.compile's Triton codegen, so the remaining gain from a hand-tuned kernel would be smaller than originally estimated.
+Reduce `--seq_len` from 50 to 25 for both GRU and Mamba.
 
-- **Expected speedup**: ~1.3-1.5x on the RSSM forward (diminishing returns after whole-loop compile)
-- **Effort**: High (custom Triton kernel with backward pass)
-- **Risk**: Low (no algorithmic change)
-
-### Approach 2: Linear recurrence with parallel scan
-
-Replace the GRU with a linear recurrence (e.g., S4, S5, Mamba-style) that supports parallel prefix scan computation: O(log T) sequential depth instead of O(T).
-
-- **Expected speedup**: 10-20x on the sequential dimension
-- **Effort**: High (architecture change, revalidation needed)
-- **Risk**: High (different inductive bias, may hurt world model quality)
-- **References**:
-  - S5: "Simplified State Space Layers for Sequence Modeling"
-  - Mamba: "Linear-Time Sequence Modeling with Selective State Spaces"
-
-The GRU's nonlinear gates are what prevent parallelization. A linear recurrence `h_t = A * h_{t-1} + B * x_t` can be computed for all T in parallel using an associative scan. The tradeoff is that linear recurrences have weaker expressivity per step, which may require wider hidden states to compensate.
-
-### Approach 3: Reduce sequence length
-
-The simplest option: reduce `--seq_len` from 50 to 25.
-
-- **Expected speedup**: ~2x on the RSSM loop (~1.5x end-to-end)
+- **Expected speedup**: ~1.5x end-to-end for GRU, ~1.2x for Mamba (already fast)
 - **Effort**: None (CLI flag change)
-- **Risk**: Low-medium (shorter temporal context may hurt world model predictions for long-horizon dependencies)
+- **Risk**: Low-medium (shorter temporal context)
 
-Can be combined with any of the above approaches.
+### Validate Mamba quality
 
-## Recommended next steps
+Run comparison training (GRU vs Mamba) for 50k-100k env steps to verify:
+- World model losses (reconstruction, reward, KL) are comparable
+- Episode reward curves converge similarly
+- Imagination accuracy is maintained
 
-1. **Reduce seq_len** — quick experiment to validate the speedup is worth the context tradeoff
-2. **Linear recurrence** — biggest potential gain but requires architecture research
+If Mamba quality matches GRU, it's a strict improvement (faster + fewer params).
