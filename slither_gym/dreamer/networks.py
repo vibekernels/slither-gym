@@ -91,13 +91,13 @@ def mlp(in_dim: int, hidden: int, out_dim: int, layers: int = 2) -> nn.Sequentia
 # ---------------------------------------------------------------------------
 
 class CNNEncoder(nn.Module):
-    """Encodes 64x64x3 images to a flat embedding vector."""
+    """Encodes 64x64xC images to a flat embedding vector."""
 
-    def __init__(self, depth: int = 32, out_dim: int = 512):
+    def __init__(self, depth: int = 32, out_dim: int = 512, in_channels: int = 3):
         super().__init__()
         # 64->32->16->8->4 with channels depth*[1,2,4,8]
         self.convs = nn.Sequential(
-            nn.Conv2d(3, depth, 4, 2, 1), nn.SiLU(),
+            nn.Conv2d(in_channels, depth, 4, 2, 1), nn.SiLU(),
             nn.Conv2d(depth, depth * 2, 4, 2, 1), nn.SiLU(),
             nn.Conv2d(depth * 2, depth * 4, 4, 2, 1), nn.SiLU(),
             nn.Conv2d(depth * 4, depth * 8, 4, 2, 1), nn.SiLU(),
@@ -573,9 +573,10 @@ class WorldModel(nn.Module):
         cnn_depth: int = 32,
         reward_bins: int = 255,
         rssm_type: str = "gru",
+        in_channels: int = 3,
     ):
         super().__init__()
-        self.encoder = CNNEncoder(depth=cnn_depth, out_dim=embed_dim)
+        self.encoder = CNNEncoder(depth=cnn_depth, out_dim=embed_dim, in_channels=in_channels)
         if rssm_type == "mamba":
             self.rssm = MambaRSSM(
                 embed_dim=embed_dim,

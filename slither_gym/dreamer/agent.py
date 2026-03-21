@@ -92,9 +92,10 @@ def _mamba_wm_forward(encoder, rssm, decoder, reward_head, continue_head,
     features = all_features.permute(1, 0, 2)  # (T, B, D) -> (B, T, D)
     feat_flat = features.reshape(B * T, -1)
 
-    # Decode
+    # Decode (reconstructs 3-channel image; target is last 3 channels of stacked obs)
     recon = decoder(feat_flat)
-    recon_loss = F.mse_loss(recon, obs_flat)
+    recon_target = obs_flat[:, -3:]  # last 3 channels = most recent frame
+    recon_loss = F.mse_loss(recon, recon_target)
 
     # Reward prediction
     reward_logits = reward_head(feat_flat).reshape(B, T, -1)
@@ -182,6 +183,7 @@ class DreamerV3Agent:
         rssm_type: str = "gru",
         grad_checkpoint: bool = False,
         imagine_starts: int = 1,
+        frame_stack: int = 1,
     ):
         # TF32 gives ~1.5x matmul speedup on Ampere+ GPUs with negligible precision loss
         torch.set_float32_matmul_precision("high")
@@ -199,6 +201,7 @@ class DreamerV3Agent:
         self.free_nats = free_nats
         self.kl_scale = kl_scale
         self.imagine_starts = imagine_starts
+        self.frame_stack = frame_stack
 
         # Mixed precision
         self.use_amp = use_amp and self.device.type == "cuda"
@@ -219,6 +222,7 @@ class DreamerV3Agent:
             cnn_depth=cnn_depth,
             reward_bins=reward_bins,
             rssm_type=rssm_type,
+            in_channels=3 * frame_stack,
         ).to(self.device)
 
         if self._grad_checkpoint:
@@ -324,11 +328,43 @@ class DreamerV3Agent:
         # Running state for acting
         self._prev_state = None
         self._prev_action = None
+        self._frame_history = None  # (N, K, 3, H, W) ring buffer for frame stacking
 
     def init_state(self, batch_size: int = 1):
         """Reset agent state for acting."""
         self._prev_state = self.world_model.rssm.initial_state(batch_size, self.device)
         self._prev_action = torch.zeros(batch_size, self.action_dim, device=self.device)
+        if self.frame_stack > 1:
+            self._frame_history = None  # lazily initialized on first obs
+
+    def _stack_frames_single(self, obs_chw: torch.Tensor) -> torch.Tensor:
+        """Stack K frames for single-env inference. obs_chw: (1, 3, H, W)."""
+        K = self.frame_stack
+        if K == 1:
+            return obs_chw
+        if self._frame_history is None:
+            # Initialize with K copies of the first frame
+            self._frame_history = obs_chw.repeat(1, K, 1, 1)  # (1, 3*K, H, W)
+        else:
+            # Shift left by 3 channels and append new frame
+            self._frame_history = torch.cat([
+                self._frame_history[:, 3:], obs_chw
+            ], dim=1)
+        return self._frame_history
+
+    def _stack_frames_batch(self, obs_nchw: torch.Tensor) -> torch.Tensor:
+        """Stack K frames for batch inference. obs_nchw: (N, 3, H, W)."""
+        K = self.frame_stack
+        if K == 1:
+            return obs_nchw
+        N = obs_nchw.shape[0]
+        if self._frame_history is None:
+            self._frame_history = obs_nchw.repeat(1, K, 1, 1)  # (N, 3*K, H, W)
+        else:
+            self._frame_history = torch.cat([
+                self._frame_history[:, 3:], obs_nchw
+            ], dim=1)
+        return self._frame_history
 
     @torch.no_grad()
     def act(self, obs: np.ndarray, training: bool = True) -> int:
@@ -338,6 +374,7 @@ class DreamerV3Agent:
 
         # Preprocess obs: (H, W, 3) uint8 -> (1, 3, H, W) float
         obs_t = torch.from_numpy(obs).float().permute(2, 0, 1).unsqueeze(0).to(self.device) / 255.0
+        obs_t = self._stack_frames_single(obs_t)  # (1, 3*K, H, W)
 
         # Encode
         with torch.amp.autocast(self.device.type, dtype=self.amp_dtype, enabled=self.use_amp):
@@ -372,6 +409,7 @@ class DreamerV3Agent:
             self.init_state(N)
 
         obs_t = torch.from_numpy(obs_batch).float().permute(0, 3, 1, 2).to(self.device) / 255.0
+        obs_t = self._stack_frames_batch(obs_t)  # (N, 3*K, H, W)
 
         with torch.amp.autocast(self.device.type, dtype=self.amp_dtype, enabled=self.use_amp):
             embed = self.world_model.encoder(obs_t)
@@ -403,6 +441,9 @@ class DreamerV3Agent:
         self._prev_state.deter[idx] = init.deter[0]
         self._prev_state.stoch[idx] = init.stoch[0]
         self._prev_action[idx] = 0.0
+        # Reset frame history for this env
+        if self.frame_stack > 1 and self._frame_history is not None:
+            self._frame_history[idx] = 0.0
 
     def transfer_batch(self, batch: dict[str, np.ndarray]) -> tuple:
         """Transfer a CPU batch to GPU tensors. Called from pre-fetch thread.
@@ -498,7 +539,7 @@ class DreamerV3Agent:
             with torch.amp.autocast(self.device.type, dtype=self.amp_dtype, enabled=self.use_amp):
                 feat_flat = features.reshape(B * T, -1)
                 recon = self._compiled_decoder(feat_flat)
-                obs_target = obs.reshape(B * T, *obs.shape[2:])
+                obs_target = obs.reshape(B * T, *obs.shape[2:])[:, -3:]
                 recon_loss = F.mse_loss(recon, obs_target)
 
                 reward_logits = self.world_model.reward_head(feat_flat).reshape(B, T, -1)

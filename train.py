@@ -240,6 +240,8 @@ def main():
                         help="Enable gradient checkpointing (~10%% slower but ~40%% less VRAM)")
     parser.add_argument("--imagine_starts", type=int, default=1,
                         help="Number of posterior timesteps to start imagination from (DreamerV3: all T)")
+    parser.add_argument("--frame_stack", type=int, default=1,
+                        help="Number of frames to stack along channel dim (1=no stacking)")
     args = parser.parse_args()
 
     # Setup
@@ -269,6 +271,7 @@ def main():
         rssm_type=args.rssm_type,
         grad_checkpoint=args.grad_checkpoint,
         imagine_starts=args.imagine_starts,
+        frame_stack=args.frame_stack,
     )
 
     resumed_env_steps = 0
@@ -277,7 +280,8 @@ def main():
         resumed_env_steps, resumed_train_steps = agent.load(args.resume)
         print(f"Resumed from {args.resume} (env_steps={resumed_env_steps}, train_steps={resumed_train_steps})")
 
-    buffer = ReplayBuffer(capacity=args.buffer_capacity, seq_len=args.seq_len)
+    buffer = ReplayBuffer(capacity=args.buffer_capacity, seq_len=args.seq_len,
+                          frame_stack=args.frame_stack)
 
     # --- Prefill buffer ---
     print(f"Prefilling buffer with {args.prefill} steps of random actions...")
@@ -306,6 +310,8 @@ def main():
     print(f"Batch size: {args.batch_size}, Sequence length: {args.seq_len}")
     print(f"Mixed precision: {amp_status}")
     print(f"Collection: {'async (' + str(args.num_envs) + ' envs)' if use_async else 'sync (1 env)'}")
+    if args.frame_stack > 1:
+        print(f"Frame stacking: {args.frame_stack} frames ({3 * args.frame_stack} input channels)")
     print(f"Logging to: {logdir}\n")
 
     # Warm up torch.compile JIT before starting async collector to avoid

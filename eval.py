@@ -9,9 +9,11 @@ import gymnasium as gym
 from slither_gym.dreamer.agent import DreamerV3Agent
 
 
-def evaluate(checkpoint_path: str, num_episodes: int = 50, device: str = "cuda"):
+def evaluate(checkpoint_path: str, num_episodes: int = 50, device: str = "cuda",
+             frame_stack: int = 1):
     env = gym.make("Slither-v0")
-    agent = DreamerV3Agent(action_dim=env.action_space.n, device=device, compile_models=False)
+    agent = DreamerV3Agent(action_dim=env.action_space.n, device=device, compile_models=False,
+                           frame_stack=frame_stack)
     agent.load(checkpoint_path)
     print(f"Loaded checkpoint: {checkpoint_path}")
     print(f"Running {num_episodes} evaluation episodes (greedy policy)...\n")
@@ -81,5 +83,7 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint", default="runs/slither/checkpoint_final.pt")
     parser.add_argument("--episodes", type=int, default=50)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--frame_stack", type=int, default=1,
+                        help="Must match training config")
     args = parser.parse_args()
-    evaluate(args.checkpoint, args.episodes, args.device)
+    evaluate(args.checkpoint, args.episodes, args.device, args.frame_stack)

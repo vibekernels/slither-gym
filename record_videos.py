@@ -48,13 +48,16 @@ def main():
     parser.add_argument("--scale", type=int, default=8,
                         help="Upscale factor (64px * scale)")
     parser.add_argument("--fps", type=int, default=30)
+    parser.add_argument("--frame_stack", type=int, default=1,
+                        help="Must match training config")
     args = parser.parse_args()
 
     os.makedirs(args.outdir, exist_ok=True)
     env = gym.make("Slither-v0")
 
     # Load trained agent
-    agent = DreamerV3Agent(action_dim=env.action_space.n, device=args.device, compile_models=False)
+    agent = DreamerV3Agent(action_dim=env.action_space.n, device=args.device, compile_models=False,
+                           frame_stack=args.frame_stack)
     agent.load(args.checkpoint)
     print(f"Loaded checkpoint: {args.checkpoint}\n")
 

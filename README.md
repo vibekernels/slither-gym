@@ -28,12 +28,12 @@ pip install torch --index-url https://download.pytorch.org/whl/cu121
 ```bash
 # GPU — Mamba RSSM (fastest, recommended for RTX 3090+)
 PYTHONUNBUFFERED=1 python train.py --device cuda --rssm_type mamba \
-    --batch_size 384 --num_envs 8 --steps 500000 --imagine_starts 4 \
+    --batch_size 384 --num_envs 8 --steps 500000 --imagine_starts 4 --frame_stack 3 \
     --food_reward 1.5 --kill_reward 10.0 --death_scale 0.1 --survival_bonus -0.005 \
     2>&1 | tee runs/train.log
 
 # GPU — Mamba, lower VRAM (<16GB)
-python train.py --device cuda --rssm_type mamba --batch_size 128 --imagine_starts 4 --steps 500000
+python train.py --device cuda --rssm_type mamba --batch_size 128 --imagine_starts 4 --frame_stack 3 --steps 500000
 
 # GPU — GRU RSSM (default, works on all GPUs)
 python train.py --device cuda --steps 500000
@@ -61,6 +61,7 @@ python train.py --device cpu --steps 6000 --prefill 1000 --train_ratio 32 --batc
 | `--no_amp` | — | Disable mixed precision (bf16) |
 | `--rssm_type` | `gru` | RSSM backend: `gru` or `mamba` (parallel scan SSM) |
 | `--imagine_starts` | 1 | Imagination starting states per batch (4 recommended, see below) |
+| `--frame_stack` | 1 | Stack K consecutive frames along channel dim (3 recommended, see below) |
 | `--grad_checkpoint` | — | Trade ~10% speed for ~40% less VRAM (enables B=512+) |
 | `--food_reward` | 1.5 | Reward per food eaten |
 | `--kill_reward` | 10.0 | Reward per kill |
@@ -79,6 +80,19 @@ By default, actor-critic training imagines forward from only the final RSSM stat
 | **K=4 (recommended)** | **+16.2** | **194** |
 
 K=4 adds ~12% to train_step time but produces significantly better policies through more diverse actor-critic training.
+
+### Frame stacking (`--frame_stack`)
+
+With `--frame_stack K`, the agent receives K consecutive frames stacked along the channel dimension (e.g., 3 channels becomes 9 for K=3). This gives the world model implicit velocity/motion information, helping the agent perceive movement direction, speed, and predict collisions.
+
+**`--frame_stack 3` is recommended.** At 500k steps on Slither-v0 (with `--imagine_starts 4`):
+
+| Setting | Last 50 eps avg return | SPS |
+|---|---|---|
+| frame_stack=1 | +16.2 | 194 |
+| **frame_stack=3 (recommended)** | **+44.5** | **152** |
+
+Frame stacking gives a 2.7x improvement in average return. The SPS reduction (~22%) comes from 3x more input channels through the CNN encoder. Note: eval and video recording scripts require `--frame_stack` to match the training config.
 
 ### Monitoring
 
