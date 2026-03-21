@@ -46,7 +46,7 @@ cdef class VecSlither:
     cdef double death_food_frac
     cdef int npc_respawn_delay
 
-    # Reward config
+    # Reward config (unused — reward is pure delta-length, kept for API compat)
     cdef double r_food, r_kill, r_death_scale, r_survival, r_boost_cost
 
     # Player state  (n_envs,)
@@ -270,10 +270,11 @@ cdef class VecSlither:
     cdef void _step_env(self, int e, int action) noexcept nogil:
         cdef unsigned long long* rng = &self.rng_state[e]
         cdef int turn_action, wants_boost
-        cdef double reward = self.r_survival
+        cdef double reward = 0.0
         cdef int food_eaten = 0, kills = 0, died = 0
         cdef double dx, dy, dist_sq, eat_r_sq
         cdef int fi, ni, nidx, k, seg_idx, new_head
+        cdef int length_before = self.plength[e]
 
         self.pstep[e] += 1
 
@@ -323,7 +324,6 @@ cdef class VecSlither:
                 if self.pscore[e] < 0.0:
                     self.pscore[e] = 0.0
                 self.pboost_debt[e] -= 1.0
-            reward += self.r_boost_cost
         else:
             self.px[e] += cos(self.pdir[e]) * self.base_speed
             self.py[e] += sin(self.pdir[e]) * self.base_speed
@@ -349,8 +349,7 @@ cdef class VecSlither:
                 if self.plength[e] < MAX_SEG:
                     self.plength[e] += 1
                 self.pscore[e] += 1.0
-        if food_eaten > 0:
-            reward += self.r_food * <double>food_eaten
+        # (food_eaten already reflected in plength above)
 
         # ---- NPCs eat food ----
         self._npc_eat_food(e)
@@ -367,8 +366,6 @@ cdef class VecSlither:
         # ---- collision: NPC head vs player body -> kills ----
         if not died:
             kills = self._npc_hits_player_body(e)
-            if kills > 0:
-                reward += self.r_kill * <double>kills
 
         # ---- NPC boundary / cleanup ----
         self._npc_boundary_check(e)
@@ -392,11 +389,8 @@ cdef class VecSlither:
                 if self.nrespawn[nidx] <= 0:
                     self._spawn_npc(e, ni)
 
-        # ---- death penalty ----
-        if died:
-            reward -= self.r_death_scale * <double>self.plength[e]
-
-        # ---- accumulate ----
+        # ---- reward = delta(snake_length) ----
+        reward = <double>(self.plength[e] - length_before)
         self.rew_buf[e] = <float>reward
         self.ep_return[e] += reward
         self.ep_len[e] = self.pstep[e]
