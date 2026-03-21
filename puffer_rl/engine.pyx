@@ -14,6 +14,10 @@ DEF NUM_NPCS = 4
 DEF K_FOOD = 16
 DEF K_NPC = 8
 DEF OBS_DIM_VAL = 54  # 6 + K_FOOD*2 + K_NPC*2
+DEF SPATIAL_H = 32
+DEF SPATIAL_W = 32
+DEF SPATIAL_C = 5     # food, own_body, npc_body, boundary, own_head
+DEF SPATIAL_SCALAR = 3  # length, boosting, dist_to_edge
 
 
 # ---------- RNG helpers ----------
@@ -68,6 +72,9 @@ cdef class VecSlither:
 
     # Output buffers
     cdef float[:,::1] obs_buf
+    cdef float[:,:,:,::1] spatial_buf   # (n_envs, SPATIAL_C, H, W)
+    cdef float[:,::1] scalar_buf        # (n_envs, SPATIAL_SCALAR)
+    cdef int use_spatial
     cdef float[::1] rew_buf
     cdef cnp.uint8_t[::1] done_buf
 
@@ -84,9 +91,11 @@ cdef class VecSlither:
     def __init__(self, int n_envs, int seed=42,
                  double food_reward=1.5, double kill_reward=10.0,
                  double death_scale=0.1, double survival_bonus=-0.005,
-                 double boost_cost=-0.01):
+                 double boost_cost=-0.01,
+                 bint spatial_obs=False):
         self.n_envs = n_envs
         self.obs_dim = OBS_DIM_VAL
+        self.use_spatial = spatial_obs
 
         # Config
         self.arena_radius = 1000.0
@@ -144,6 +153,10 @@ cdef class VecSlither:
         self.factive = np.zeros((n_envs, MAX_FOOD), dtype=np.intc)
 
         self.obs_buf  = np.zeros((n_envs, OBS_DIM_VAL), dtype=np.float32)
+        if spatial_obs:
+            self.spatial_buf = np.zeros((n_envs, SPATIAL_C, SPATIAL_H, SPATIAL_W),
+                                       dtype=np.float32)
+            self.scalar_buf  = np.zeros((n_envs, SPATIAL_SCALAR), dtype=np.float32)
         self.rew_buf  = np.zeros(n_envs, dtype=np.float32)
         self.done_buf = np.zeros(n_envs, dtype=np.uint8)
 
@@ -167,11 +180,16 @@ cdef class VecSlither:
 
     # -------------------------------------------------------- public reset
     def reset_all(self):
-        """Reset every environment.  Returns initial obs (n_envs, obs_dim)."""
+        """Reset every environment.  Returns initial obs."""
         cdef int e
         for e in prange(self.n_envs, nogil=True, schedule='static'):
             self._reset_env(e)
             self._compute_obs_env(e)
+            if self.use_spatial:
+                self._compute_spatial_obs_env(e)
+        if self.use_spatial:
+            return (np.asarray(self.spatial_buf).copy(),
+                    np.asarray(self.scalar_buf).copy())
         return np.asarray(self.obs_buf).copy()
 
     # -------------------------------------------------------- public step
@@ -187,6 +205,16 @@ cdef class VecSlither:
             self.ep_slen_buf[e] = 0
             self._step_env(e, act[e])
             self._compute_obs_env(e)
+            if self.use_spatial:
+                self._compute_spatial_obs_env(e)
+        if self.use_spatial:
+            return (np.asarray(self.spatial_buf),
+                    np.asarray(self.scalar_buf),
+                    np.asarray(self.rew_buf),
+                    np.asarray(self.done_buf),
+                    np.asarray(self.ep_ret_buf),
+                    np.asarray(self.ep_len_buf),
+                    np.asarray(self.ep_slen_buf))
         return (np.asarray(self.obs_buf),
                 np.asarray(self.rew_buf),
                 np.asarray(self.done_buf),
@@ -655,3 +683,95 @@ cdef class VecSlither:
             else:
                 self.obs_buf[e, off + i * 2]     = 0.0
                 self.obs_buf[e, off + i * 2 + 1] = 0.0
+
+    # ------------------------------------------------- spatial observation
+    cdef void _compute_spatial_obs_env(self, int e) noexcept nogil:
+        """Render ego-centric spatial grid: (SPATIAL_C, SPATIAL_H, SPATIAL_W).
+
+        Channels: 0=food, 1=own_body, 2=npc_body, 3=boundary, 4=own_head
+        Scalar:   0=length, 1=boosting, 2=dist_to_edge
+        """
+        cdef double cd = cos(self.pdir[e])
+        cdef double sd = sin(self.pdir[e])
+        cdef double vp = self.viewport  # half-extent of the grid in world units
+        cdef double cell_size = (2.0 * vp) / <double>SPATIAL_W
+        cdef double inv_cell = 1.0 / cell_size
+        cdef int r, c, i, k, seg_idx, nidx
+        cdef double dx, dy, ego_x, ego_y, wx, wy, dist_sq
+        cdef int gr, gc
+        cdef double half_h = <double>SPATIAL_H * 0.5
+        cdef double half_w = <double>SPATIAL_W * 0.5
+
+        # Clear spatial buffer for this env
+        for c in range(SPATIAL_C):
+            for r in range(SPATIAL_H):
+                for gc in range(SPATIAL_W):
+                    self.spatial_buf[e, c, r, gc] = 0.0
+
+        # --- Channel 3: boundary ---
+        # For each cell, check if the world position is outside the arena
+        cdef double ar_sq = self.arena_radius * self.arena_radius
+        for r in range(SPATIAL_H):
+            for gc in range(SPATIAL_W):
+                # Cell center in ego coords (forward = +row, right = +col)
+                ego_x = (<double>r - half_h + 0.5) * cell_size
+                ego_y = (<double>gc - half_w + 0.5) * cell_size
+                # Transform ego → world
+                wx = self.px[e] + cd * ego_x - sd * ego_y
+                wy = self.py[e] + sd * ego_x + cd * ego_y
+                dist_sq = wx * wx + wy * wy
+                if dist_sq > ar_sq:
+                    self.spatial_buf[e, 3, r, gc] = 1.0
+
+        # --- Channel 0: food ---
+        for i in range(MAX_FOOD):
+            if not self.factive[e, i]:
+                continue
+            dx = self.fx[e, i] - self.px[e]
+            dy = self.fy[e, i] - self.py[e]
+            # Ego-centric rotation
+            ego_x =  cd * dx + sd * dy
+            ego_y = -sd * dx + cd * dy
+            # Grid cell
+            gr = <int>(ego_x * inv_cell + half_h)
+            gc = <int>(ego_y * inv_cell + half_w)
+            if 0 <= gr < SPATIAL_H and 0 <= gc < SPATIAL_W:
+                self.spatial_buf[e, 0, gr, gc] = 1.0
+
+        # --- Channel 1: own body ---
+        for k in range(self.plength[e]):
+            seg_idx = (self.pseg_head[e] - k + MAX_SEG) % MAX_SEG
+            dx = self.pseg_x[e, seg_idx] - self.px[e]
+            dy = self.pseg_y[e, seg_idx] - self.py[e]
+            ego_x =  cd * dx + sd * dy
+            ego_y = -sd * dx + cd * dy
+            gr = <int>(ego_x * inv_cell + half_h)
+            gc = <int>(ego_y * inv_cell + half_w)
+            if 0 <= gr < SPATIAL_H and 0 <= gc < SPATIAL_W:
+                self.spatial_buf[e, 1, gr, gc] = 1.0
+
+        # --- Channel 4: own head (center of grid) ---
+        self.spatial_buf[e, 4, SPATIAL_H // 2, SPATIAL_W // 2] = 1.0
+
+        # --- Channel 2: NPC body ---
+        cdef int npc_base = e * NUM_NPCS
+        for i in range(NUM_NPCS):
+            nidx = npc_base + i
+            if not self.nalive[nidx]:
+                continue
+            for k in range(self.nlength[nidx]):
+                seg_idx = (self.nseg_head[nidx] - k + MAX_SEG) % MAX_SEG
+                dx = self.nseg_x[nidx, seg_idx] - self.px[e]
+                dy = self.nseg_y[nidx, seg_idx] - self.py[e]
+                ego_x =  cd * dx + sd * dy
+                ego_y = -sd * dx + cd * dy
+                gr = <int>(ego_x * inv_cell + half_h)
+                gc = <int>(ego_y * inv_cell + half_w)
+                if 0 <= gr < SPATIAL_H and 0 <= gc < SPATIAL_W:
+                    self.spatial_buf[e, 2, gr, gc] = 1.0
+
+        # --- Scalar features ---
+        self.scalar_buf[e, 0] = <float>(<double>self.plength[e] / <double>MAX_SEG)
+        self.scalar_buf[e, 1] = <float>self.pboosting[e]
+        self.scalar_buf[e, 2] = <float>(sqrt(self.px[e]*self.px[e] + self.py[e]*self.py[e])
+                                        / self.arena_radius)
