@@ -26,7 +26,7 @@ torch.set_num_threads(4)
 torch.set_num_interop_threads(1)
 
 from puffer_rl.engine import VecSlither
-from puffer_rl.model import MLPPolicy, MLPLSTMPolicy
+from puffer_rl.model import MLPPolicy, MLPLSTMPolicy, CNNPolicy
 
 
 # --------------------------------------------------------------------------- #
@@ -150,6 +150,62 @@ def collect_rollout_lstm(engine, model, obs, lstm_state, rollout_len,
         "values": buf_val, "rewards": buf_rew, "dones": buf_done,
         "bootstrap_value": bootstrap_val, "final_obs": obs.copy(),
         "final_lstm_state": lstm_state,
+        "ep_returns": ep_returns, "ep_lengths": ep_lengths,
+        "ep_snake_lengths": ep_snake_lengths,
+    }
+
+
+def collect_rollout_cnn(engine, model, spatial_obs, scalar_obs, rollout_len,
+                        num_envs):
+    """Collect rollout with CNN model on CPU. Engine returns spatial obs."""
+    sp_shape = spatial_obs.shape[1:]  # (C, H, W)
+    sc_dim = scalar_obs.shape[1]
+    buf_spatial = np.zeros((rollout_len, num_envs, *sp_shape), dtype=np.float32)
+    buf_scalar  = np.zeros((rollout_len, num_envs, sc_dim), dtype=np.float32)
+    buf_act  = np.zeros((rollout_len, num_envs), dtype=np.int64)
+    buf_logp = np.zeros((rollout_len, num_envs), dtype=np.float32)
+    buf_val  = np.zeros((rollout_len, num_envs), dtype=np.float32)
+    buf_rew  = np.zeros((rollout_len, num_envs), dtype=np.float32)
+    buf_done = np.zeros((rollout_len, num_envs), dtype=np.float32)
+    act_buf  = np.zeros(num_envs, dtype=np.intc)
+
+    ep_returns, ep_lengths, ep_snake_lengths = [], [], []
+
+    with torch.no_grad():
+        for t in range(rollout_len):
+            buf_spatial[t] = spatial_obs
+            buf_scalar[t] = scalar_obs
+            sp_t = torch.from_numpy(spatial_obs)
+            sc_t = torch.from_numpy(scalar_obs)
+            action, logprob, _, value = model.get_action_and_value(sp_t, sc_t)
+            act_np = action.numpy()
+            buf_act[t]  = act_np
+            buf_logp[t] = logprob.numpy()
+            buf_val[t]  = value.numpy()
+            np.copyto(act_buf, act_np, casting='unsafe')
+
+            spatial_obs, scalar_obs, rewards, dones, ep_ret, ep_len, ep_slen = \
+                engine.step(act_buf)
+            buf_rew[t]  = rewards
+            buf_done[t] = dones.astype(np.float32)
+
+            for i in range(num_envs):
+                if dones[i]:
+                    ep_returns.append(float(ep_ret[i]))
+                    ep_lengths.append(int(ep_len[i]))
+                    ep_snake_lengths.append(int(ep_slen[i]))
+
+        sp_t = torch.from_numpy(spatial_obs)
+        sc_t = torch.from_numpy(scalar_obs)
+        _, _, _, bootstrap_val = model.get_action_and_value(sp_t, sc_t)
+        bootstrap_val = bootstrap_val.numpy().copy()
+
+    return {
+        "spatial": buf_spatial, "scalar": buf_scalar,
+        "actions": buf_act, "logprobs": buf_logp,
+        "values": buf_val, "rewards": buf_rew, "dones": buf_done,
+        "bootstrap_value": bootstrap_val,
+        "final_spatial": spatial_obs.copy(), "final_scalar": scalar_obs.copy(),
         "ep_returns": ep_returns, "ep_lengths": ep_lengths,
         "ep_snake_lengths": ep_snake_lengths,
     }
@@ -360,6 +416,65 @@ def ppo_update_lstm(model, optimizer, rollout, initial_lstm_state,
 
 
 # --------------------------------------------------------------------------- #
+#  PPO update — CNN version (random minibatches, spatial + scalar inputs)       #
+# --------------------------------------------------------------------------- #
+
+def ppo_update_cnn(model, optimizer, spatial_t, scalar_t, act_t, old_logp_t,
+                   adv_t, ret_t, clip_ratio, epochs, num_minibatches,
+                   ent_coef, vf_coef, max_grad_norm, amp_dtype=torch.float32):
+    total = spatial_t.shape[0]
+    mb_size = total // num_minibatches
+    device = spatial_t.device
+
+    metrics = {"pg_loss": 0, "vf_loss": 0, "entropy": 0, "clipfrac": 0}
+    num_updates = 0
+
+    for _ in range(epochs):
+        perm = torch.randperm(total, device=device)
+        for start in range(0, total, mb_size):
+            end = min(start + mb_size, total)
+            idx = perm[start:end]
+
+            mb_sp    = spatial_t[idx]
+            mb_sc    = scalar_t[idx]
+            mb_act   = act_t[idx]
+            mb_oldlp = old_logp_t[idx]
+            mb_adv   = adv_t[idx]
+            mb_ret   = ret_t[idx]
+
+            mb_adv = (mb_adv - mb_adv.mean()) / (mb_adv.std() + 1e-8)
+
+            with torch.amp.autocast("cuda", dtype=amp_dtype,
+                                    enabled=amp_dtype != torch.float32):
+                _, new_logp, entropy, new_val = model.get_action_and_value(
+                    mb_sp, mb_sc, action=mb_act
+                )
+                ratio = torch.exp(new_logp - mb_oldlp)
+                surr1 = ratio * mb_adv
+                surr2 = torch.clamp(ratio, 1 - clip_ratio,
+                                    1 + clip_ratio) * mb_adv
+                pg_loss  = -torch.min(surr1, surr2).mean()
+                vf_loss  = 0.5 * ((new_val - mb_ret) ** 2).mean()
+                ent_loss = entropy.mean()
+                loss = pg_loss + vf_coef * vf_loss - ent_coef * ent_loss
+
+            optimizer.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+            optimizer.step()
+
+            metrics["pg_loss"]  += pg_loss.item()
+            metrics["vf_loss"]  += vf_loss.item()
+            metrics["entropy"]  += ent_loss.item()
+            metrics["clipfrac"] += (
+                ((ratio - 1.0).abs() > clip_ratio).float().mean().item()
+            )
+            num_updates += 1
+
+    return {k: v / max(num_updates, 1) for k, v in metrics.items()}
+
+
+# --------------------------------------------------------------------------- #
 #  Main                                                                        #
 # --------------------------------------------------------------------------- #
 
@@ -384,6 +499,8 @@ def parse_args():
     p.add_argument("--lstm", action="store_true",
                    help="Use MLP-LSTM instead of pure MLP")
     p.add_argument("--lstm_dim", type=int, default=128)
+    p.add_argument("--cnn", action="store_true",
+                   help="Use CNN with spatial ego-centric grid obs")
     p.add_argument("--anneal_lr", action="store_true",
                    help="Linear LR annealing to 0")
     p.add_argument("--device", type=str, default="cpu")
@@ -402,6 +519,7 @@ def main():
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     use_lstm = args.lstm
+    use_cnn = args.cnn
 
     device = torch.device(args.device)
     use_gpu = device.type == "cuda"
@@ -409,17 +527,24 @@ def main():
         torch.backends.cudnn.benchmark = True
 
     # ---- engine ----
-    engine = VecSlither(n_envs=args.num_envs, seed=args.seed)
+    engine = VecSlither(n_envs=args.num_envs, seed=args.seed,
+                        spatial_obs=use_cnn)
     obs_dim = engine.obs_dim
     act_dim = 6
-    frame_stack_k = args.frame_stack if not use_lstm else 1
+    frame_stack_k = args.frame_stack if not (use_lstm or use_cnn) else 1
     model_input_dim = obs_dim * frame_stack_k
     print(f"Engine: {args.num_envs} envs, obs_dim={obs_dim}")
-    if frame_stack_k > 1:
+    if use_cnn:
+        print(f"Spatial obs: ({5}, 32, 32) + 3 scalars")
+    elif frame_stack_k > 1:
         print(f"Frame stacking: {frame_stack_k} frames → {model_input_dim}-dim input")
 
     # ---- model ----
-    if use_lstm:
+    if use_cnn:
+        model = CNNPolicy(spatial_channels=5, spatial_h=32, spatial_w=32,
+                          scalar_dim=3, act_dim=act_dim,
+                          hidden_dim=args.hidden_dim).to(device)
+    elif use_lstm:
         model = MLPLSTMPolicy(obs_dim=obs_dim, act_dim=act_dim,
                               hidden_dim=args.hidden_dim,
                               lstm_dim=args.lstm_dim).to(device)
@@ -429,7 +554,7 @@ def main():
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, eps=1e-5)
 
     total_params = sum(p.numel() for p in model.parameters())
-    kind = "MLP-LSTM" if use_lstm else "MLP"
+    kind = "CNN" if use_cnn else ("MLP-LSTM" if use_lstm else "MLP")
     print(f"Model: {kind}, {total_params:,} parameters, hidden={args.hidden_dim}")
 
     if args.compile and use_gpu:
@@ -458,7 +583,12 @@ def main():
     writer = SummaryWriter(args.logdir)
 
     # ---- initial state ----
-    obs = engine.reset_all()
+    spatial_obs, scalar_obs = None, None
+    if use_cnn:
+        spatial_obs, scalar_obs = engine.reset_all()
+        obs = None
+    else:
+        obs = engine.reset_all()
     frame_stack = np.zeros((args.num_envs, frame_stack_k, obs_dim),
                            dtype=np.float32)
     lstm_state = None
@@ -514,7 +644,14 @@ def main():
             else:
                 cpu_sd = {k: v.cpu() for k, v in model.state_dict().items()}
                 sync_cpu_model.load_state_dict(cpu_sd)
-            if use_lstm:
+            if use_cnn:
+                rollout = collect_rollout_cnn(
+                    engine, sync_cpu_model, spatial_obs, scalar_obs,
+                    args.rollout_len, args.num_envs,
+                )
+                spatial_obs = rollout["final_spatial"]
+                scalar_obs = rollout["final_scalar"]
+            elif use_lstm:
                 init_lstm = (lstm_state[0].clone(), lstm_state[1].clone())
                 rollout = collect_rollout_lstm(
                     engine, sync_cpu_model, obs, lstm_state,
@@ -542,7 +679,23 @@ def main():
         )
 
         # ---- PPO ----
-        if use_lstm:
+        if use_cnn:
+            T, N = rollout["spatial"].shape[:2]
+            total = T * N
+            sp_gpu   = torch.from_numpy(rollout["spatial"].reshape(total, *rollout["spatial"].shape[2:])).to(device)
+            sc_gpu   = torch.from_numpy(rollout["scalar"].reshape(total, -1)).to(device)
+            act_gpu  = torch.from_numpy(rollout["actions"].reshape(total)).to(device)
+            logp_gpu = torch.from_numpy(rollout["logprobs"].reshape(total)).to(device)
+            adv_flat = adv_t.reshape(total)
+            ret_flat = ret_t.reshape(total)
+
+            metrics = ppo_update_cnn(
+                model, optimizer, sp_gpu, sc_gpu, act_gpu, logp_gpu,
+                adv_flat, ret_flat,
+                args.clip_ratio, args.ppo_epochs, args.num_minibatches,
+                args.ent_coef, args.vf_coef, args.max_grad_norm, amp_dtype,
+            )
+        elif use_lstm:
             if not use_async:
                 init_lstm_gpu = (init_lstm[0].to(device), init_lstm[1].to(device))
             else:

@@ -1,4 +1,4 @@
-"""Policy/value models for PPO: pure MLP and MLP-LSTM variants."""
+"""Policy/value models for PPO: MLP, MLP-LSTM, and CNN variants."""
 
 import numpy as np
 import torch
@@ -119,3 +119,51 @@ class MLPLSTMPolicy(nn.Module):
         if action is None:
             action = dist.sample()
         return action, dist.log_prob(action), dist.entropy(), values, new_state
+
+
+# ──────────────────────────────────────────────────────────────────────
+#  CNN (spatial ego-centric grid + scalar features)
+# ──────────────────────────────────────────────────────────────────────
+
+class CNNPolicy(nn.Module):
+    """CNN on spatial grid + scalar side-channel → policy + value."""
+
+    def __init__(self, spatial_channels=5, spatial_h=32, spatial_w=32,
+                 scalar_dim=3, act_dim=6, hidden_dim=256):
+        super().__init__()
+        self.conv = nn.Sequential(
+            layer_init(nn.Conv2d(spatial_channels, 32, 3, stride=2, padding=1)),
+            nn.ReLU(),
+            layer_init(nn.Conv2d(32, 64, 3, stride=2, padding=1)),
+            nn.ReLU(),
+            layer_init(nn.Conv2d(64, 64, 3, stride=1, padding=1)),
+            nn.ReLU(),
+        )
+        # After stride=2 twice: 32→16→8
+        conv_out = 64 * (spatial_h // 4) * (spatial_w // 4)
+        self.fc = nn.Sequential(
+            layer_init(nn.Linear(conv_out + scalar_dim, hidden_dim)),
+            nn.ReLU(),
+            layer_init(nn.Linear(hidden_dim, hidden_dim)),
+            nn.ReLU(),
+        )
+        self.policy_head = layer_init(nn.Linear(hidden_dim, act_dim), std=0.01)
+        self.value_head = layer_init(nn.Linear(hidden_dim, 1), std=1.0)
+
+    def forward(self, spatial, scalar):
+        """spatial: (..., C, H, W), scalar: (..., scalar_dim)."""
+        batch_shape = spatial.shape[:-3]
+        flat_spatial = spatial.reshape(-1, *spatial.shape[-3:])
+        x = self.conv(flat_spatial)
+        x = x.reshape(*batch_shape, -1)
+        x = torch.cat([x, scalar], dim=-1)
+        x = self.fc(x)
+        return self.policy_head(x), self.value_head(x).squeeze(-1)
+
+    def get_action_and_value(self, spatial, scalar, action=None):
+        """Returns (action, log_prob, entropy, value)."""
+        logits, values = self.forward(spatial, scalar)
+        dist = Categorical(logits=logits)
+        if action is None:
+            action = dist.sample()
+        return action, dist.log_prob(action), dist.entropy(), values
