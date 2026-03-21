@@ -39,6 +39,7 @@ def collect_rollout_mlp(engine, model, obs, rollout_len, num_envs, obs_dim):
     buf_val  = np.zeros((rollout_len, num_envs), dtype=np.float32)
     buf_rew  = np.zeros((rollout_len, num_envs), dtype=np.float32)
     buf_done = np.zeros((rollout_len, num_envs), dtype=np.float32)
+    act_buf  = np.zeros(num_envs, dtype=np.intc)  # pre-allocated
 
     ep_returns, ep_lengths, ep_snake_lengths = [], [], []
 
@@ -51,10 +52,9 @@ def collect_rollout_mlp(engine, model, obs, rollout_len, num_envs, obs_dim):
             buf_act[t]  = act_np
             buf_logp[t] = logprob.numpy()
             buf_val[t]  = value.numpy()
+            np.copyto(act_buf, act_np, casting='unsafe')
 
-            obs, rewards, dones, ep_ret, ep_len, ep_slen = engine.step(
-                act_np.astype(np.intc)
-            )
+            obs, rewards, dones, ep_ret, ep_len, ep_slen = engine.step(act_buf)
             buf_rew[t]  = rewards
             buf_done[t] = dones.astype(np.float32)
 
@@ -67,12 +67,12 @@ def collect_rollout_mlp(engine, model, obs, rollout_len, num_envs, obs_dim):
         # Bootstrap
         obs_t = torch.from_numpy(obs)
         _, _, _, bootstrap_val = model.get_action_and_value(obs_t)
-        bootstrap_val = bootstrap_val.numpy()
+        bootstrap_val = bootstrap_val.numpy().copy()
 
     return {
         "obs": buf_obs, "actions": buf_act, "logprobs": buf_logp,
         "values": buf_val, "rewards": buf_rew, "dones": buf_done,
-        "bootstrap_value": bootstrap_val, "final_obs": obs,
+        "bootstrap_value": bootstrap_val, "final_obs": obs.copy(),
         "ep_returns": ep_returns, "ep_lengths": ep_lengths,
         "ep_snake_lengths": ep_snake_lengths,
     }
@@ -123,12 +123,12 @@ def collect_rollout_lstm(engine, model, obs, lstm_state, rollout_len,
 
         obs_t = torch.from_numpy(obs)
         _, _, _, bootstrap_val, _ = model.get_action_and_value(obs_t, lstm_state)
-        bootstrap_val = bootstrap_val.numpy()
+        bootstrap_val = bootstrap_val.numpy().copy()
 
     return {
         "obs": buf_obs, "actions": buf_act, "logprobs": buf_logp,
         "values": buf_val, "rewards": buf_rew, "dones": buf_done,
-        "bootstrap_value": bootstrap_val, "final_obs": obs,
+        "bootstrap_value": bootstrap_val, "final_obs": obs.copy(),
         "final_lstm_state": lstm_state,
         "ep_returns": ep_returns, "ep_lengths": ep_lengths,
         "ep_snake_lengths": ep_snake_lengths,

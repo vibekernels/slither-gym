@@ -9,7 +9,7 @@ from cython.parallel cimport prange
 cnp.import_array()
 
 DEF MAX_SEG = 200
-DEF MAX_FOOD = 1024
+DEF MAX_FOOD = 512
 DEF NUM_NPCS = 4
 DEF K_FOOD = 16
 DEF K_NPC = 8
@@ -99,7 +99,7 @@ cdef class VecSlither:
         self.segment_spacing = 4.0
         self.initial_length  = 10
         self.max_steps       = 4000
-        self.initial_food    = 800
+        self.initial_food    = 400
         self.food_respawn_rate = 3
         self.death_food_frac   = 0.8
         self.npc_respawn_delay = 30
@@ -187,12 +187,12 @@ cdef class VecSlither:
             self.ep_slen_buf[e] = 0
             self._step_env(e, act[e])
             self._compute_obs_env(e)
-        return (np.asarray(self.obs_buf).copy(),
-                np.asarray(self.rew_buf).copy(),
-                np.asarray(self.done_buf).copy(),
-                np.asarray(self.ep_ret_buf).copy(),
-                np.asarray(self.ep_len_buf).copy(),
-                np.asarray(self.ep_slen_buf).copy())
+        return (np.asarray(self.obs_buf),
+                np.asarray(self.rew_buf),
+                np.asarray(self.done_buf),
+                np.asarray(self.ep_ret_buf),
+                np.asarray(self.ep_len_buf),
+                np.asarray(self.ep_slen_buf))
 
     # ============================================================ internals
     # -------------------------------------------------------- reset one env
