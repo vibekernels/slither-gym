@@ -1,11 +1,13 @@
 """PPO training with Cython vectorized environments.
 
-Supports both pure-MLP (default, fully parallel) and MLP-LSTM models.
+Supports pure-MLP (default) with frame stacking, and MLP-LSTM models.
 Optimizations:
   - CPU inference during collection (no GPU transfers per step)
-  - Async double-buffer (collection overlaps with GPU PPO update)
+  - Async double-buffer (optional, --async_collect)
   - GPU-accelerated GAE
   - OpenMP-parallelized Cython engine
+  - Frame stacking for temporal context (--frame_stack K)
+  - LR annealing (linear decay to 0)
 """
 
 import argparse
@@ -28,25 +30,37 @@ from puffer_rl.model import MLPPolicy, MLPLSTMPolicy
 
 
 # --------------------------------------------------------------------------- #
-#  Rollout collection (CPU-only inference — no GPU transfers)                   #
+#  Rollout collection (CPU-only inference)                                     #
 # --------------------------------------------------------------------------- #
 
-def collect_rollout_mlp(engine, model, obs, rollout_len, num_envs, obs_dim):
-    """Collect rollout with a pure-MLP model on CPU."""
-    buf_obs  = np.zeros((rollout_len, num_envs, obs_dim), dtype=np.float32)
+def collect_rollout_mlp(engine, model, obs, frame_stack, rollout_len,
+                        num_envs, obs_dim, frame_stack_k):
+    """Collect rollout with frame-stacked MLP on CPU.
+
+    frame_stack: (num_envs, K, obs_dim) — persistent across rollouts.
+    """
+    stacked_dim = obs_dim * frame_stack_k
+    buf_obs  = np.zeros((rollout_len, num_envs, stacked_dim), dtype=np.float32)
     buf_act  = np.zeros((rollout_len, num_envs), dtype=np.int64)
     buf_logp = np.zeros((rollout_len, num_envs), dtype=np.float32)
     buf_val  = np.zeros((rollout_len, num_envs), dtype=np.float32)
     buf_rew  = np.zeros((rollout_len, num_envs), dtype=np.float32)
     buf_done = np.zeros((rollout_len, num_envs), dtype=np.float32)
-    act_buf  = np.zeros(num_envs, dtype=np.intc)  # pre-allocated
+    act_buf  = np.zeros(num_envs, dtype=np.intc)
 
     ep_returns, ep_lengths, ep_snake_lengths = [], [], []
 
     with torch.no_grad():
         for t in range(rollout_len):
-            buf_obs[t] = obs
-            obs_t = torch.from_numpy(obs)  # CPU tensor — no transfer
+            # Push current obs into frame stack
+            frame_stack[:, :-1] = frame_stack[:, 1:]
+            frame_stack[:, -1] = obs
+
+            # Flatten stack → (num_envs, K * obs_dim)
+            stacked = frame_stack.reshape(num_envs, stacked_dim)
+            buf_obs[t] = stacked
+
+            obs_t = torch.from_numpy(stacked)
             action, logprob, _, value = model.get_action_and_value(obs_t)
             act_np = action.numpy()
             buf_act[t]  = act_np
@@ -58,14 +72,19 @@ def collect_rollout_mlp(engine, model, obs, rollout_len, num_envs, obs_dim):
             buf_rew[t]  = rewards
             buf_done[t] = dones.astype(np.float32)
 
+            # Reset frame stack for done envs
             for i in range(num_envs):
                 if dones[i]:
+                    frame_stack[i] = 0.0
                     ep_returns.append(float(ep_ret[i]))
                     ep_lengths.append(int(ep_len[i]))
                     ep_snake_lengths.append(int(ep_slen[i]))
 
-        # Bootstrap
-        obs_t = torch.from_numpy(obs)
+        # Bootstrap with final stacked obs
+        frame_stack[:, :-1] = frame_stack[:, 1:]
+        frame_stack[:, -1] = obs
+        stacked = frame_stack.reshape(num_envs, stacked_dim)
+        obs_t = torch.from_numpy(stacked)
         _, _, _, bootstrap_val = model.get_action_and_value(obs_t)
         bootstrap_val = bootstrap_val.numpy().copy()
 
@@ -73,6 +92,7 @@ def collect_rollout_mlp(engine, model, obs, rollout_len, num_envs, obs_dim):
         "obs": buf_obs, "actions": buf_act, "logprobs": buf_logp,
         "values": buf_val, "rewards": buf_rew, "dones": buf_done,
         "bootstrap_value": bootstrap_val, "final_obs": obs.copy(),
+        "frame_stack": frame_stack,
         "ep_returns": ep_returns, "ep_lengths": ep_lengths,
         "ep_snake_lengths": ep_snake_lengths,
     }
@@ -87,6 +107,7 @@ def collect_rollout_lstm(engine, model, obs, lstm_state, rollout_len,
     buf_val  = np.zeros((rollout_len, num_envs), dtype=np.float32)
     buf_rew  = np.zeros((rollout_len, num_envs), dtype=np.float32)
     buf_done = np.zeros((rollout_len, num_envs), dtype=np.float32)
+    act_buf  = np.zeros(num_envs, dtype=np.intc)
 
     ep_returns, ep_lengths, ep_snake_lengths = [], [], []
 
@@ -101,10 +122,9 @@ def collect_rollout_lstm(engine, model, obs, lstm_state, rollout_len,
             buf_act[t]  = act_np
             buf_logp[t] = logprob.numpy()
             buf_val[t]  = value.numpy()
+            np.copyto(act_buf, act_np, casting='unsafe')
 
-            obs, rewards, dones, ep_ret, ep_len, ep_slen = engine.step(
-                act_np.astype(np.intc)
-            )
+            obs, rewards, dones, ep_ret, ep_len, ep_slen = engine.step(act_buf)
             buf_rew[t]  = rewards
             buf_done[t] = dones.astype(np.float32)
 
@@ -140,35 +160,32 @@ def collect_rollout_lstm(engine, model, obs, lstm_state, rollout_len,
 # --------------------------------------------------------------------------- #
 
 class AsyncCollector:
-    """Runs collection in a background thread with a CPU model copy.
-
-    Overlaps data collection with GPU PPO updates so neither sits idle.
-    """
+    """Runs collection in a background thread with a CPU model copy."""
 
     def __init__(self, engine, gpu_model, obs, num_envs, obs_dim,
-                 rollout_len, use_lstm, lstm_state=None):
+                 rollout_len, use_lstm, lstm_state=None,
+                 frame_stack=None, frame_stack_k=1):
         self.engine = engine
         self.num_envs = num_envs
         self.obs_dim = obs_dim
         self.rollout_len = rollout_len
         self.use_lstm = use_lstm
+        self.frame_stack_k = frame_stack_k
 
-        # CPU model for inference during collection
         self.cpu_model = copy.deepcopy(gpu_model).cpu().eval()
         self.obs = obs
         self.lstm_state = lstm_state
+        self.frame_stack = frame_stack
 
         self._result = None
         self._thread = None
 
     def sync_weights(self, gpu_model):
-        """Copy GPU model weights to CPU model."""
         gpu_sd = gpu_model.state_dict()
         cpu_sd = {k: v.cpu() for k, v in gpu_sd.items()}
         self.cpu_model.load_state_dict(cpu_sd)
 
     def launch(self):
-        """Start collection in background thread."""
         self._result = None
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
@@ -181,16 +198,18 @@ class AsyncCollector:
             )
         else:
             self._result = collect_rollout_mlp(
-                self.engine, self.cpu_model, self.obs,
+                self.engine, self.cpu_model, self.obs, self.frame_stack,
                 self.rollout_len, self.num_envs, self.obs_dim,
+                self.frame_stack_k,
             )
 
     def join(self):
-        """Wait for collection to finish and return the rollout."""
         self._thread.join()
         self.obs = self._result["final_obs"]
         if self.use_lstm:
             self.lstm_state = self._result["final_lstm_state"]
+        else:
+            self.frame_stack = self._result["frame_stack"]
         return self._result
 
 
@@ -200,7 +219,6 @@ class AsyncCollector:
 
 def compute_gae_gpu(rewards, values, dones, bootstrap_value, gamma,
                     gae_lambda, device):
-    """Compute GAE on GPU. Inputs are numpy, outputs are GPU tensors."""
     rew_t  = torch.from_numpy(rewards).to(device)
     val_t  = torch.from_numpy(values).to(device)
     done_t = torch.from_numpy(dones).to(device)
@@ -360,17 +378,21 @@ def parse_args():
     p.add_argument("--ent_coef", type=float, default=0.01)
     p.add_argument("--vf_coef", type=float, default=0.5)
     p.add_argument("--max_grad_norm", type=float, default=0.5)
-    p.add_argument("--hidden_dim", type=int, default=128)
+    p.add_argument("--hidden_dim", type=int, default=256)
+    p.add_argument("--frame_stack", type=int, default=4,
+                   help="Number of frames to stack (1=no stacking)")
     p.add_argument("--lstm", action="store_true",
                    help="Use MLP-LSTM instead of pure MLP")
     p.add_argument("--lstm_dim", type=int, default=128)
+    p.add_argument("--anneal_lr", action="store_true",
+                   help="Linear LR annealing to 0")
     p.add_argument("--device", type=str, default="cpu")
     p.add_argument("--compile", action="store_true")
     p.add_argument("--no_amp", action="store_true")
     p.add_argument("--async_collect", action="store_true",
                    help="Enable async double-buffer (helps when PPO is slow)")
     p.add_argument("--logdir", type=str, default="runs/puffer_ppo")
-    p.add_argument("--save_every", type=int, default=100_000)
+    p.add_argument("--save_every", type=int, default=5_000_000)
     p.add_argument("--checkpoint", type=str, default=None)
     return p.parse_args()
 
@@ -390,7 +412,11 @@ def main():
     engine = VecSlither(n_envs=args.num_envs, seed=args.seed)
     obs_dim = engine.obs_dim
     act_dim = 6
+    frame_stack_k = args.frame_stack if not use_lstm else 1
+    model_input_dim = obs_dim * frame_stack_k
     print(f"Engine: {args.num_envs} envs, obs_dim={obs_dim}")
+    if frame_stack_k > 1:
+        print(f"Frame stacking: {frame_stack_k} frames → {model_input_dim}-dim input")
 
     # ---- model ----
     if use_lstm:
@@ -398,13 +424,13 @@ def main():
                               hidden_dim=args.hidden_dim,
                               lstm_dim=args.lstm_dim).to(device)
     else:
-        model = MLPPolicy(obs_dim=obs_dim, act_dim=act_dim,
+        model = MLPPolicy(obs_dim=model_input_dim, act_dim=act_dim,
                           hidden_dim=args.hidden_dim).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, eps=1e-5)
 
     total_params = sum(p.numel() for p in model.parameters())
     kind = "MLP-LSTM" if use_lstm else "MLP"
-    print(f"Model: {kind}, {total_params:,} parameters")
+    print(f"Model: {kind}, {total_params:,} parameters, hidden={args.hidden_dim}")
 
     if args.compile and use_gpu:
         model = torch.compile(model)
@@ -417,7 +443,7 @@ def main():
 
     use_async = use_gpu and args.async_collect
     if use_async:
-        print("Async double-buffer: enabled (CPU collection + GPU training)")
+        print("Async double-buffer: enabled")
 
     if args.checkpoint and os.path.exists(args.checkpoint):
         ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
@@ -433,14 +459,15 @@ def main():
 
     # ---- initial state ----
     obs = engine.reset_all()
+    frame_stack = np.zeros((args.num_envs, frame_stack_k, obs_dim),
+                           dtype=np.float32)
     lstm_state = None
     init_lstm = None
     if use_lstm:
-        cpu_lstm = (
+        lstm_state = (
             torch.zeros(1, args.num_envs, args.lstm_dim),
             torch.zeros(1, args.num_envs, args.lstm_dim),
         )
-        lstm_state = cpu_lstm
 
     steps_per_update = args.num_envs * args.rollout_len
     num_updates = (args.total_steps - start_step) // steps_per_update
@@ -449,7 +476,8 @@ def main():
     print(f"Training for {num_updates} updates "
           f"({steps_per_update} steps/update, total {args.total_steps} steps)")
     print(f"  PPO: epochs={args.ppo_epochs}, mb={args.num_minibatches}, "
-          f"clip={args.clip_ratio}, ent={args.ent_coef}")
+          f"clip={args.clip_ratio}, ent={args.ent_coef}"
+          f"{', anneal_lr' if args.anneal_lr else ''}")
 
     # ---- async collector setup ----
     collector = None
@@ -457,6 +485,7 @@ def main():
         collector = AsyncCollector(
             engine, model, obs, args.num_envs, obs_dim,
             args.rollout_len, use_lstm, lstm_state,
+            frame_stack, frame_stack_k,
         )
 
     t_start = time.time()
@@ -467,15 +496,19 @@ def main():
     for update in range(num_updates):
         t_update = time.time()
 
+        # ---- LR annealing ----
+        if args.anneal_lr:
+            frac = 1.0 - update / num_updates
+            for pg in optimizer.param_groups:
+                pg["lr"] = args.lr * frac
+
         # ---- collect ----
         if use_async:
             if update == 0:
-                # First rollout: just collect synchronously
                 collector.sync_weights(model)
                 collector.launch()
             rollout = collector.join()
         else:
-            # Synchronous: use CPU model copy for inference
             if update == 0:
                 sync_cpu_model = copy.deepcopy(model).cpu().eval()
             else:
@@ -491,10 +524,12 @@ def main():
                 lstm_state = rollout["final_lstm_state"]
             else:
                 rollout = collect_rollout_mlp(
-                    engine, sync_cpu_model, obs,
+                    engine, sync_cpu_model, obs, frame_stack,
                     args.rollout_len, args.num_envs, obs_dim,
+                    frame_stack_k,
                 )
                 obs = rollout["final_obs"]
+                frame_stack = rollout["frame_stack"]
 
         recent_returns.extend(rollout["ep_returns"])
         recent_lengths.extend(rollout["ep_lengths"])
@@ -523,7 +558,6 @@ def main():
                 device, amp_dtype,
             )
         else:
-            # Transfer rollout data to GPU for PPO
             T, N = rollout["obs"].shape[:2]
             total = T * N
             obs_gpu  = torch.from_numpy(rollout["obs"].reshape(total, -1)).to(device)
@@ -561,6 +595,9 @@ def main():
             writer.add_scalar("losses/vf_loss", metrics["vf_loss"], global_step)
             writer.add_scalar("losses/entropy", metrics["entropy"], global_step)
             writer.add_scalar("losses/clipfrac", metrics["clipfrac"], global_step)
+            if args.anneal_lr:
+                writer.add_scalar("charts/lr",
+                                  optimizer.param_groups[0]["lr"], global_step)
 
             elapsed = time.time() - t_start
             print(f"[{global_step:>8d}] "
