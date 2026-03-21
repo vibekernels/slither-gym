@@ -260,9 +260,11 @@ def main():
         rssm_type=args.rssm_type,
     )
 
+    resumed_env_steps = 0
+    resumed_train_steps = 0
     if args.resume:
-        agent.load(args.resume)
-        print(f"Resumed from {args.resume}")
+        resumed_env_steps, resumed_train_steps = agent.load(args.resume)
+        print(f"Resumed from {args.resume} (env_steps={resumed_env_steps}, train_steps={resumed_train_steps})")
 
     buffer = ReplayBuffer(capacity=1_000_000, seq_len=args.seq_len)
 
@@ -274,8 +276,8 @@ def main():
     print(f"Prefilled {buffer.total_steps} steps across {len(buffer._episodes)} episodes")
 
     # --- Main training loop ---
-    total_env_steps = buffer.total_steps
-    train_steps = 0
+    total_env_steps = resumed_env_steps + buffer.total_steps
+    train_steps = resumed_train_steps
     episode_count = 0
     last_save = 0
     pending_env_steps = 0  # steps collected but not yet trained on
@@ -353,7 +355,7 @@ def main():
             if total_env_steps - last_save >= args.save_every:
                 ckpt_path = logdir / f"checkpoint_{total_env_steps}.pt"
                 with collector.lock:
-                    agent.save(str(ckpt_path))
+                    agent.save(str(ckpt_path), env_steps=total_env_steps, train_steps=train_steps)
                 print(f"  -> Saved checkpoint: {ckpt_path}")
                 last_save = total_env_steps
 
@@ -394,13 +396,13 @@ def main():
 
             if total_env_steps - last_save >= args.save_every:
                 ckpt_path = logdir / f"checkpoint_{total_env_steps}.pt"
-                agent.save(str(ckpt_path))
+                agent.save(str(ckpt_path), env_steps=total_env_steps, train_steps=train_steps)
                 print(f"  -> Saved checkpoint: {ckpt_path}")
                 last_save = total_env_steps
         env.close()
 
     # Final save
-    agent.save(str(logdir / "checkpoint_final.pt"))
+    agent.save(str(logdir / "checkpoint_final.pt"), env_steps=total_env_steps, train_steps=train_steps)
     print(f"\nTraining complete! {total_env_steps} env steps, {train_steps} train steps")
     print(f"Final checkpoint: {logdir / 'checkpoint_final.pt'}")
     writer.close()

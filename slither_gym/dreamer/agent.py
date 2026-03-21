@@ -524,7 +524,7 @@ class DreamerV3Agent:
 
         return returns
 
-    def save(self, path: str):
+    def save(self, path: str, env_steps: int = 0, train_steps: int = 0):
         torch.save({
             "world_model": self.world_model.state_dict(),
             "actor": self.actor.state_dict(),
@@ -533,6 +533,8 @@ class DreamerV3Agent:
             "model_opt": self.model_opt.state_dict(),
             "actor_opt": self.actor_opt.state_dict(),
             "critic_opt": self.critic_opt.state_dict(),
+            "env_steps": env_steps,
+            "train_steps": train_steps,
         }, path)
 
     def load(self, path: str):
@@ -544,3 +546,4 @@ class DreamerV3Agent:
         self.model_opt.load_state_dict(ckpt["model_opt"])
         self.actor_opt.load_state_dict(ckpt["actor_opt"])
         self.critic_opt.load_state_dict(ckpt["critic_opt"])
+        return ckpt.get("env_steps", 0), ckpt.get("train_steps", 0)
