@@ -1,4 +1,4 @@
-"""MLP-LSTM policy/value model for PPO."""
+"""Policy/value models for PPO: pure MLP and MLP-LSTM variants."""
 
 import numpy as np
 import torch
@@ -12,13 +12,46 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     return layer
 
 
-class MLPLSTMPolicy(nn.Module):
-    """MLP encoder -> LSTM -> policy + value heads.
+# ──────────────────────────────────────────────────────────────────────
+#  Pure MLP (no recurrence — fully parallel training)
+# ──────────────────────────────────────────────────────────────────────
 
-    Uses a fast path when no episode boundaries exist in the sequence,
-    calling the LSTM on the full sequence at once (cuDNN fused kernel).
-    Falls back to step-by-step processing only when resets are needed.
-    """
+class MLPPolicy(nn.Module):
+    """Pure MLP policy/value network. No hidden state, fully parallel."""
+
+    def __init__(self, obs_dim=54, act_dim=6, hidden_dim=128):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            layer_init(nn.Linear(obs_dim, hidden_dim)),
+            nn.ReLU(),
+            layer_init(nn.Linear(hidden_dim, hidden_dim)),
+            nn.ReLU(),
+            layer_init(nn.Linear(hidden_dim, hidden_dim)),
+            nn.ReLU(),
+        )
+        self.policy_head = layer_init(nn.Linear(hidden_dim, act_dim), std=0.01)
+        self.value_head = layer_init(nn.Linear(hidden_dim, 1), std=1.0)
+
+    def forward(self, obs):
+        """obs: any shape (..., obs_dim). Returns logits, values."""
+        x = self.encoder(obs)
+        return self.policy_head(x), self.value_head(x).squeeze(-1)
+
+    def get_action_and_value(self, obs, action=None):
+        """Returns (action, log_prob, entropy, value)."""
+        logits, values = self.forward(obs)
+        dist = Categorical(logits=logits)
+        if action is None:
+            action = dist.sample()
+        return action, dist.log_prob(action), dist.entropy(), values
+
+
+# ──────────────────────────────────────────────────────────────────────
+#  MLP-LSTM (kept for comparison / optional use)
+# ──────────────────────────────────────────────────────────────────────
+
+class MLPLSTMPolicy(nn.Module):
+    """MLP encoder -> LSTM -> policy + value heads."""
 
     def __init__(self, obs_dim=54, act_dim=6, hidden_dim=128, lstm_dim=128):
         super().__init__()
@@ -47,16 +80,6 @@ class MLPLSTMPolicy(nn.Module):
         )
 
     def forward(self, obs, lstm_state, done=None):
-        """
-        Args:
-            obs: (T, N, obs_dim) or (N, obs_dim)
-            lstm_state: tuple (h, c) each (1, N, lstm_dim)
-            done: (T, N) float tensor or None
-        Returns:
-            logits: (T, N, act_dim) or (N, act_dim)
-            values: (T, N) or (N,)
-            new_lstm_state: tuple (h, c)
-        """
         single = obs.dim() == 2
         if single:
             obs = obs.unsqueeze(0)
@@ -68,11 +91,9 @@ class MLPLSTMPolicy(nn.Module):
 
         h, c = lstm_state
 
-        # Fast path: no episode boundaries → single fused LSTM call
         if done is None or done.sum() == 0:
             x, (h, c) = self.lstm(x, (h, c))
         else:
-            # Slow path: step-by-step with LSTM state resets (rare)
             outputs = []
             for t in range(T):
                 if t > 0:
@@ -93,7 +114,6 @@ class MLPLSTMPolicy(nn.Module):
         return logits, values, (h, c)
 
     def get_action_and_value(self, obs, lstm_state, action=None, done=None):
-        """Convenience: returns (action, log_prob, entropy, value, new_state)."""
         logits, values, new_state = self.forward(obs, lstm_state, done)
         dist = Categorical(logits=logits)
         if action is None:
