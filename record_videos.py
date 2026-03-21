@@ -54,7 +54,7 @@ def main():
     env = gym.make("Slither-v0")
 
     # Load trained agent
-    agent = DreamerV3Agent(action_dim=env.action_space.n, device=args.device)
+    agent = DreamerV3Agent(action_dim=env.action_space.n, device=args.device, compile_models=False)
     agent.load(args.checkpoint)
     print(f"Loaded checkpoint: {args.checkpoint}\n")
 

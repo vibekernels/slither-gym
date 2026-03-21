@@ -11,7 +11,7 @@ from slither_gym.dreamer.agent import DreamerV3Agent
 
 def evaluate(checkpoint_path: str, num_episodes: int = 50, device: str = "cuda"):
     env = gym.make("Slither-v0")
-    agent = DreamerV3Agent(action_dim=env.action_space.n, device=device)
+    agent = DreamerV3Agent(action_dim=env.action_space.n, device=device, compile_models=False)
     agent.load(checkpoint_path)
     print(f"Loaded checkpoint: {checkpoint_path}")
     print(f"Running {num_episodes} evaluation episodes (greedy policy)...\n")

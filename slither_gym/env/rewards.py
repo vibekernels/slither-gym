@@ -21,4 +21,6 @@ def compute_reward(events: dict, config: RewardConfig) -> float:
         reward -= config.death_scale * length
     if events.get("boosting", False):
         reward += config.boost_cost
+    # Subtract mass lost from boosting (same rate as food_eaten so recycling is net-zero)
+    reward -= events.get("boost_pellets_dropped", 0) * config.food_eaten
     return reward

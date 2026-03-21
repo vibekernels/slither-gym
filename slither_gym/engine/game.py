@@ -60,6 +60,7 @@ class GameState:
             "died": False,
             "boosting": False,
             "length": self.player.length,
+            "boost_pellets_dropped": 0,
         }
 
         # Apply player action
@@ -83,7 +84,10 @@ class GameState:
                     tail_pos = snake.positions[snake.tail_idx].copy()
                     self.food.spawn_boost_pellet(tail_pos)
                     snake.shrink(1)
+                    snake.score = max(0.0, snake.score - 1.0)
                     snake._boost_debt -= 1.0
+                    if snake.id == 0:
+                        self.events["boost_pellets_dropped"] += 1
             else:
                 snake.move(self.config.base_speed)
 
