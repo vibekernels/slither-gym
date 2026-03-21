@@ -8,7 +8,7 @@ from cython.parallel cimport prange
 
 cnp.import_array()
 
-DEF MAX_SEG = 200
+DEF MAX_SEG = 500
 DEF MAX_FOOD = 512
 DEF NUM_NPCS = 4
 DEF K_FOOD = 16
