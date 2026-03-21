@@ -366,9 +366,20 @@ Sustained training throughput: **242 SPS** at B=384 (the training bottleneck).
 
 Mamba has been validated at 100k steps on Slither-v0: episodes reach consistent 20-35+ returns with 4001-step survival. Quality is comparable to GRU at similar env step counts.
 
-### Multi-start imagination
+### 30. Multi-start imagination (--imagine_starts K) ✅
 
-Currently imagination starts from only the final posterior state (step T). DreamerV3 starts from all T states, giving B×T starting states. This would increase actor-critic training diversity at the cost of T× more imagination compute. A practical compromise: sample a subset (e.g., 8 time steps per batch).
+DreamerV3 starts imagination from all T posterior states. We previously used only the final state (step T). Now `--imagine_starts K` samples K random timesteps, giving K×B starting states for imagination.
+
+B=384 K=4: 174ms/step (216 SPS) with 1536 imagination starts vs K=1: 156ms/step (242 SPS) with 384 starts. 12% slower but 4x more AC training diversity.
+
+**500k step A/B test on Slither-v0:**
+
+| Setting | Last 50 eps avg return | Total episodes |
+|---|---|---|
+| K=1 | -7.0 | 211 |
+| **K=4** | **+16.2** | **449** |
+
+K=1 learned to survive (long episodes) but not to score. K=4 consistently achieved positive returns through food/kills. Multi-start is now the recommended default.
 
 ### Theoretical limits
 
