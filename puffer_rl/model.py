@@ -13,7 +13,12 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
 
 
 class MLPLSTMPolicy(nn.Module):
-    """MLP encoder -> LSTM -> policy + value heads."""
+    """MLP encoder -> LSTM -> policy + value heads.
+
+    Uses a fast path when no episode boundaries exist in the sequence,
+    calling the LSTM on the full sequence at once (cuDNN fused kernel).
+    Falls back to step-by-step processing only when resets are needed.
+    """
 
     def __init__(self, obs_dim=54, act_dim=6, hidden_dim=128, lstm_dim=128):
         super().__init__()
@@ -62,17 +67,22 @@ class MLPLSTMPolicy(nn.Module):
         x = self.encoder(obs.reshape(T * N, -1)).reshape(T, N, -1)
 
         h, c = lstm_state
-        outputs = []
-        for t in range(T):
-            # Reset LSTM state at episode boundaries
-            if done is not None and t > 0:
-                mask = (1.0 - done[t - 1]).unsqueeze(0).unsqueeze(-1)
-                h = h * mask
-                c = c * mask
-            out, (h, c) = self.lstm(x[t : t + 1], (h, c))
-            outputs.append(out)
 
-        x = torch.cat(outputs, dim=0)  # (T, N, lstm_dim)
+        # Fast path: no episode boundaries → single fused LSTM call
+        if done is None or done.sum() == 0:
+            x, (h, c) = self.lstm(x, (h, c))
+        else:
+            # Slow path: step-by-step with LSTM state resets (rare)
+            outputs = []
+            for t in range(T):
+                if t > 0:
+                    mask = (1.0 - done[t - 1]).unsqueeze(0).unsqueeze(-1)
+                    h = h * mask
+                    c = c * mask
+                out, (h, c) = self.lstm(x[t : t + 1], (h, c))
+                outputs.append(out)
+            x = torch.cat(outputs, dim=0)
+
         logits = self.policy_head(x)
         values = self.value_head(x).squeeze(-1)
 

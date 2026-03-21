@@ -195,7 +195,7 @@ def compute_gae(rewards, values, dones, bootstrap_value, gamma, gae_lambda):
 
 def ppo_update(model, optimizer, rollout, initial_lstm_state,
                clip_ratio, epochs, num_minibatches, ent_coef, vf_coef,
-               max_grad_norm, device):
+               max_grad_norm, device, amp_dtype=torch.float32):
     """PPO clipped objective update with LSTM.
 
     Minibatches split across environments (not time) to preserve sequences.
@@ -235,18 +235,20 @@ def ppo_update(model, optimizer, rollout, initial_lstm_state,
             # Normalise advantages per minibatch
             mb_adv = (mb_adv - mb_adv.mean()) / (mb_adv.std() + 1e-8)
 
-            _, new_logp, entropy, new_val, _ = model.get_action_and_value(
-                mb_obs, (mb_h0, mb_c0), action=mb_act, done=mb_done
-            )
+            with torch.amp.autocast("cuda", dtype=amp_dtype,
+                                    enabled=amp_dtype != torch.float32):
+                _, new_logp, entropy, new_val, _ = model.get_action_and_value(
+                    mb_obs, (mb_h0, mb_c0), action=mb_act, done=mb_done
+                )
 
-            ratio = torch.exp(new_logp - mb_oldlp)
-            surr1 = ratio * mb_adv
-            surr2 = torch.clamp(ratio, 1.0 - clip_ratio, 1.0 + clip_ratio) * mb_adv
-            pg_loss = -torch.min(surr1, surr2).mean()
-            vf_loss = 0.5 * ((new_val - mb_ret) ** 2).mean()
-            ent_loss = entropy.mean()
-
-            loss = pg_loss + vf_coef * vf_loss - ent_coef * ent_loss
+                ratio = torch.exp(new_logp - mb_oldlp)
+                surr1 = ratio * mb_adv
+                surr2 = torch.clamp(ratio, 1.0 - clip_ratio,
+                                    1.0 + clip_ratio) * mb_adv
+                pg_loss = -torch.min(surr1, surr2).mean()
+                vf_loss = 0.5 * ((new_val - mb_ret) ** 2).mean()
+                ent_loss = entropy.mean()
+                loss = pg_loss + vf_coef * vf_loss - ent_coef * ent_loss
 
             optimizer.zero_grad()
             loss.backward()
@@ -296,6 +298,10 @@ def parse_args():
     p.add_argument("--boost_cost", type=float, default=-0.01)
     # System
     p.add_argument("--device", type=str, default="cpu")
+    p.add_argument("--compile", action="store_true",
+                   help="torch.compile the model for faster training")
+    p.add_argument("--no_amp", action="store_true",
+                   help="Disable mixed-precision (bf16) training")
     p.add_argument("--async_collect", action="store_true",
                    help="Overlap collection (CPU) with training (GPU)")
     p.add_argument("--logdir", type=str, default="runs/puffer_ppo")
@@ -334,6 +340,18 @@ def main():
 
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Model: {total_params:,} parameters")
+
+    # torch.compile for kernel fusion
+    if args.compile and device.type == "cuda":
+        model = torch.compile(model)
+        print("torch.compile enabled")
+
+    # Mixed precision
+    use_amp = device.type == "cuda" and not args.no_amp
+    amp_dtype = torch.bfloat16 if use_amp else torch.float32
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp and amp_dtype == torch.float16)
+    if use_amp:
+        print(f"Mixed precision: {amp_dtype}")
 
     # Resume checkpoint
     start_step = 0
@@ -421,6 +439,7 @@ def main():
             model, optimizer, rollout, init_lstm,
             args.clip_ratio, args.ppo_epochs, args.num_minibatches,
             args.ent_coef, args.vf_coef, args.max_grad_norm, device,
+            amp_dtype,
         )
 
         # Update async collector weights
