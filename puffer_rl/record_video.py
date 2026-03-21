@@ -10,7 +10,7 @@ import imageio.v3 as iio
 import slither_gym  # noqa: F401 – registers Slither-v0
 import gymnasium as gym
 
-from puffer_rl.model import MLPLSTMPolicy
+from puffer_rl.model import MLPPolicy, MLPLSTMPolicy
 
 # Must match engine.pyx constants
 K_FOOD = 16
@@ -90,24 +90,27 @@ def upscale(frame, scale=8):
     return np.kron(frame, np.ones((scale, scale, 1))).astype(np.uint8)
 
 
-def record_episode(env, model, device, greedy=True, scale=8):
+def record_episode(env, model, device, greedy=True, scale=8, use_lstm=False):
     """Run one episode, return (frames, return, length, terminated)."""
     obs_rgb, _ = env.reset()
-    # Unwrap TimeLimit / other wrappers to get the base SlitherEnv
     base = env.unwrapped
     game = base._state
     config = base.game_config
 
-    lstm_state = model.get_initial_state(1, device)
+    lstm_state = model.get_initial_state(1, device) if use_lstm else None
     frames = [upscale(obs_rgb, scale)]
     done, ret, length = False, 0.0, 0
+    max_frames = 800
 
-    while not done:
+    while not done and length < max_frames:
         state_obs = extract_obs(game, config)
         obs_t = torch.from_numpy(state_obs).unsqueeze(0).to(device)
 
         with torch.no_grad():
-            logits, value, lstm_state = model.forward(obs_t, lstm_state)
+            if use_lstm:
+                logits, value, lstm_state = model.forward(obs_t, lstm_state)
+            else:
+                logits, value = model.forward(obs_t)
 
         if greedy:
             action = logits.argmax(-1).item()
@@ -125,12 +128,13 @@ def record_episode(env, model, device, greedy=True, scale=8):
 
 def main():
     p = argparse.ArgumentParser(description="Record PPO agent videos")
-    p.add_argument("--checkpoint", default="runs/puffer_gpu/final.pt")
+    p.add_argument("--checkpoint", default="runs/puffer_90M/final.pt")
     p.add_argument("--device", default="cpu")
     p.add_argument("--outdir", default="videos_ppo")
     p.add_argument("--episodes", type=int, default=3)
     p.add_argument("--scale", type=int, default=8)
     p.add_argument("--fps", type=int, default=30)
+    p.add_argument("--lstm", action="store_true")
     args = p.parse_args()
 
     os.makedirs(args.outdir, exist_ok=True)
@@ -138,10 +142,16 @@ def main():
 
     # Load model
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
-    model = MLPLSTMPolicy(obs_dim=OBS_DIM, act_dim=6).to(device)
-    model.load_state_dict(ckpt["model"])
+    if args.lstm:
+        model = MLPLSTMPolicy(obs_dim=OBS_DIM, act_dim=6).to(device)
+    else:
+        model = MLPPolicy(obs_dim=OBS_DIM, act_dim=6).to(device)
+    # Strip _orig_mod. prefix from torch.compile checkpoints
+    sd = ckpt["model"]
+    sd = {k.replace("_orig_mod.", ""): v for k, v in sd.items()}
+    model.load_state_dict(sd)
     model.eval()
-    print(f"Loaded: {args.checkpoint}")
+    print(f"Loaded: {args.checkpoint} ({'LSTM' if args.lstm else 'MLP'})")
 
     env = gym.make("Slither-v0")
 
@@ -150,7 +160,8 @@ def main():
         print(f"\n--- {policy} policy ---")
         for ep in range(args.episodes):
             frames, ret, length, terminated = record_episode(
-                env, model, device, greedy=greedy, scale=args.scale
+                env, model, device, greedy=greedy, scale=args.scale,
+                use_lstm=args.lstm,
             )
             outcome = "died" if terminated else "survived"
             fname = f"{policy}_ep{ep+1}_{outcome}_ret{ret:.0f}_len{length}.mp4"
