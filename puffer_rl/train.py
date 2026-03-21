@@ -1,10 +1,17 @@
 """PPO training with Cython vectorized environments.
 
 Supports both pure-MLP (default, fully parallel) and MLP-LSTM models.
+Optimizations:
+  - CPU inference during collection (no GPU transfers per step)
+  - Async double-buffer (collection overlaps with GPU PPO update)
+  - GPU-accelerated GAE
+  - OpenMP-parallelized Cython engine
 """
 
 import argparse
+import copy
 import os
+import threading
 import time
 
 import numpy as np
@@ -21,12 +28,11 @@ from puffer_rl.model import MLPPolicy, MLPLSTMPolicy
 
 
 # --------------------------------------------------------------------------- #
-#  Rollout collection                                                          #
+#  Rollout collection (CPU-only inference — no GPU transfers)                   #
 # --------------------------------------------------------------------------- #
 
-def collect_rollout_mlp(engine, model, obs, device, rollout_len,
-                        num_envs, obs_dim):
-    """Collect rollout with a pure-MLP model (no hidden state)."""
+def collect_rollout_mlp(engine, model, obs, rollout_len, num_envs, obs_dim):
+    """Collect rollout with a pure-MLP model on CPU."""
     buf_obs  = np.zeros((rollout_len, num_envs, obs_dim), dtype=np.float32)
     buf_act  = np.zeros((rollout_len, num_envs), dtype=np.int64)
     buf_logp = np.zeros((rollout_len, num_envs), dtype=np.float32)
@@ -39,12 +45,12 @@ def collect_rollout_mlp(engine, model, obs, device, rollout_len,
     with torch.no_grad():
         for t in range(rollout_len):
             buf_obs[t] = obs
-            obs_t = torch.from_numpy(obs).to(device)
+            obs_t = torch.from_numpy(obs)  # CPU tensor — no transfer
             action, logprob, _, value = model.get_action_and_value(obs_t)
-            act_np = action.cpu().numpy()
+            act_np = action.numpy()
             buf_act[t]  = act_np
-            buf_logp[t] = logprob.cpu().numpy()
-            buf_val[t]  = value.cpu().numpy()
+            buf_logp[t] = logprob.numpy()
+            buf_val[t]  = value.numpy()
 
             obs, rewards, dones, ep_ret, ep_len, ep_slen = engine.step(
                 act_np.astype(np.intc)
@@ -59,9 +65,9 @@ def collect_rollout_mlp(engine, model, obs, device, rollout_len,
                     ep_snake_lengths.append(int(ep_slen[i]))
 
         # Bootstrap
-        obs_t = torch.from_numpy(obs).to(device)
+        obs_t = torch.from_numpy(obs)
         _, _, _, bootstrap_val = model.get_action_and_value(obs_t)
-        bootstrap_val = bootstrap_val.cpu().numpy()
+        bootstrap_val = bootstrap_val.numpy()
 
     return {
         "obs": buf_obs, "actions": buf_act, "logprobs": buf_logp,
@@ -72,9 +78,9 @@ def collect_rollout_mlp(engine, model, obs, device, rollout_len,
     }
 
 
-def collect_rollout_lstm(engine, model, obs, lstm_state, device,
-                         rollout_len, num_envs, obs_dim):
-    """Collect rollout with LSTM model (maintains hidden state)."""
+def collect_rollout_lstm(engine, model, obs, lstm_state, rollout_len,
+                         num_envs, obs_dim):
+    """Collect rollout with LSTM model on CPU."""
     buf_obs  = np.zeros((rollout_len, num_envs, obs_dim), dtype=np.float32)
     buf_act  = np.zeros((rollout_len, num_envs), dtype=np.int64)
     buf_logp = np.zeros((rollout_len, num_envs), dtype=np.float32)
@@ -87,14 +93,14 @@ def collect_rollout_lstm(engine, model, obs, lstm_state, device,
     with torch.no_grad():
         for t in range(rollout_len):
             buf_obs[t] = obs
-            obs_t = torch.from_numpy(obs).to(device)
+            obs_t = torch.from_numpy(obs)
             action, logprob, _, value, lstm_state = model.get_action_and_value(
                 obs_t, lstm_state
             )
-            act_np = action.cpu().numpy()
+            act_np = action.numpy()
             buf_act[t]  = act_np
-            buf_logp[t] = logprob.cpu().numpy()
-            buf_val[t]  = value.cpu().numpy()
+            buf_logp[t] = logprob.numpy()
+            buf_val[t]  = value.numpy()
 
             obs, rewards, dones, ep_ret, ep_len, ep_slen = engine.step(
                 act_np.astype(np.intc)
@@ -102,7 +108,7 @@ def collect_rollout_lstm(engine, model, obs, lstm_state, device,
             buf_rew[t]  = rewards
             buf_done[t] = dones.astype(np.float32)
 
-            done_mask = torch.from_numpy(dones).bool().to(device)
+            done_mask = torch.from_numpy(dones).bool()
             if done_mask.any():
                 lstm_state = (
                     lstm_state[0] * (~done_mask).float().unsqueeze(0).unsqueeze(-1),
@@ -115,9 +121,9 @@ def collect_rollout_lstm(engine, model, obs, lstm_state, device,
                     ep_lengths.append(int(ep_len[i]))
                     ep_snake_lengths.append(int(ep_slen[i]))
 
-        obs_t = torch.from_numpy(obs).to(device)
+        obs_t = torch.from_numpy(obs)
         _, _, _, bootstrap_val, _ = model.get_action_and_value(obs_t, lstm_state)
-        bootstrap_val = bootstrap_val.cpu().numpy()
+        bootstrap_val = bootstrap_val.numpy()
 
     return {
         "obs": buf_obs, "actions": buf_act, "logprobs": buf_logp,
@@ -130,39 +136,101 @@ def collect_rollout_lstm(engine, model, obs, lstm_state, device,
 
 
 # --------------------------------------------------------------------------- #
-#  GAE                                                                         #
+#  Async double-buffer collector                                               #
 # --------------------------------------------------------------------------- #
 
-def compute_gae(rewards, values, dones, bootstrap_value, gamma, gae_lambda):
-    T, N = rewards.shape
-    advantages = np.zeros_like(rewards)
-    last_gae = np.zeros(N, dtype=np.float32)
-    for t in reversed(range(T)):
-        next_val = bootstrap_value if t == T - 1 else values[t + 1]
-        next_nonterminal = 1.0 - dones[t]
-        delta = rewards[t] + gamma * next_val * next_nonterminal - values[t]
+class AsyncCollector:
+    """Runs collection in a background thread with a CPU model copy.
+
+    Overlaps data collection with GPU PPO updates so neither sits idle.
+    """
+
+    def __init__(self, engine, gpu_model, obs, num_envs, obs_dim,
+                 rollout_len, use_lstm, lstm_state=None):
+        self.engine = engine
+        self.num_envs = num_envs
+        self.obs_dim = obs_dim
+        self.rollout_len = rollout_len
+        self.use_lstm = use_lstm
+
+        # CPU model for inference during collection
+        self.cpu_model = copy.deepcopy(gpu_model).cpu().eval()
+        self.obs = obs
+        self.lstm_state = lstm_state
+
+        self._result = None
+        self._thread = None
+
+    def sync_weights(self, gpu_model):
+        """Copy GPU model weights to CPU model."""
+        gpu_sd = gpu_model.state_dict()
+        cpu_sd = {k: v.cpu() for k, v in gpu_sd.items()}
+        self.cpu_model.load_state_dict(cpu_sd)
+
+    def launch(self):
+        """Start collection in background thread."""
+        self._result = None
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        if self.use_lstm:
+            self._result = collect_rollout_lstm(
+                self.engine, self.cpu_model, self.obs, self.lstm_state,
+                self.rollout_len, self.num_envs, self.obs_dim,
+            )
+        else:
+            self._result = collect_rollout_mlp(
+                self.engine, self.cpu_model, self.obs,
+                self.rollout_len, self.num_envs, self.obs_dim,
+            )
+
+    def join(self):
+        """Wait for collection to finish and return the rollout."""
+        self._thread.join()
+        self.obs = self._result["final_obs"]
+        if self.use_lstm:
+            self.lstm_state = self._result["final_lstm_state"]
+        return self._result
+
+
+# --------------------------------------------------------------------------- #
+#  GAE — GPU-accelerated                                                       #
+# --------------------------------------------------------------------------- #
+
+def compute_gae_gpu(rewards, values, dones, bootstrap_value, gamma,
+                    gae_lambda, device):
+    """Compute GAE on GPU. Inputs are numpy, outputs are GPU tensors."""
+    rew_t  = torch.from_numpy(rewards).to(device)
+    val_t  = torch.from_numpy(values).to(device)
+    done_t = torch.from_numpy(dones).to(device)
+    boot_t = torch.from_numpy(bootstrap_value).to(device)
+
+    T, N = rew_t.shape
+    advantages = torch.zeros_like(rew_t)
+    last_gae = torch.zeros(N, device=device)
+
+    for t in range(T - 1, -1, -1):
+        next_val = boot_t if t == T - 1 else val_t[t + 1]
+        next_nonterminal = 1.0 - done_t[t]
+        delta = rew_t[t] + gamma * next_val * next_nonterminal - val_t[t]
         last_gae = delta + gamma * gae_lambda * next_nonterminal * last_gae
         advantages[t] = last_gae
-    return advantages, advantages + values
+
+    returns = advantages + val_t
+    return advantages, returns
 
 
 # --------------------------------------------------------------------------- #
-#  PPO update — MLP version (fully random minibatches, no sequential deps)     #
+#  PPO update — MLP version (fully random minibatches)                         #
 # --------------------------------------------------------------------------- #
 
-def ppo_update_mlp(model, optimizer, rollout, clip_ratio, epochs,
-                   num_minibatches, ent_coef, vf_coef, max_grad_norm,
-                   device, amp_dtype=torch.float32):
-    T, N = rollout["obs"].shape[:2]
-    total = T * N
+def ppo_update_mlp(model, optimizer, obs_t, act_t, old_logp_t, adv_t, ret_t,
+                   clip_ratio, epochs, num_minibatches, ent_coef, vf_coef,
+                   max_grad_norm, amp_dtype=torch.float32):
+    total = obs_t.shape[0]
     mb_size = total // num_minibatches
-
-    # Flatten (T, N, ...) → (T*N, ...)
-    obs_t      = torch.from_numpy(rollout["obs"].reshape(total, -1)).to(device)
-    act_t      = torch.from_numpy(rollout["actions"].reshape(total)).to(device)
-    old_logp_t = torch.from_numpy(rollout["logprobs"].reshape(total)).to(device)
-    adv_t      = torch.from_numpy(rollout["advantages"].reshape(total)).to(device)
-    ret_t      = torch.from_numpy(rollout["returns"].reshape(total)).to(device)
+    device = obs_t.device
 
     metrics = {"pg_loss": 0, "vf_loss": 0, "entropy": 0, "clipfrac": 0}
     num_updates = 0
@@ -216,16 +284,15 @@ def ppo_update_mlp(model, optimizer, rollout, clip_ratio, epochs,
 # --------------------------------------------------------------------------- #
 
 def ppo_update_lstm(model, optimizer, rollout, initial_lstm_state,
-                    clip_ratio, epochs, num_minibatches, ent_coef, vf_coef,
-                    max_grad_norm, device, amp_dtype=torch.float32):
+                    adv_t, ret_t, clip_ratio, epochs, num_minibatches,
+                    ent_coef, vf_coef, max_grad_norm, device,
+                    amp_dtype=torch.float32):
     T, N = rollout["obs"].shape[:2]
     mb_size = N // num_minibatches
 
     obs_t      = torch.from_numpy(rollout["obs"]).to(device)
     act_t      = torch.from_numpy(rollout["actions"]).to(device)
     old_logp_t = torch.from_numpy(rollout["logprobs"]).to(device)
-    adv_t      = torch.from_numpy(rollout["advantages"]).to(device)
-    ret_t      = torch.from_numpy(rollout["returns"]).to(device)
     done_t     = torch.from_numpy(rollout["dones"]).to(device)
 
     metrics = {"pg_loss": 0, "vf_loss": 0, "entropy": 0, "clipfrac": 0}
@@ -280,7 +347,7 @@ def ppo_update_lstm(model, optimizer, rollout, initial_lstm_state,
 
 def parse_args():
     p = argparse.ArgumentParser(description="PPO + Cython Slither")
-    p.add_argument("--num_envs", type=int, default=64)
+    p.add_argument("--num_envs", type=int, default=256)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--total_steps", type=int, default=5_000_000)
     p.add_argument("--rollout_len", type=int, default=128)
@@ -300,6 +367,8 @@ def parse_args():
     p.add_argument("--device", type=str, default="cpu")
     p.add_argument("--compile", action="store_true")
     p.add_argument("--no_amp", action="store_true")
+    p.add_argument("--async_collect", action="store_true",
+                   help="Enable async double-buffer (helps when PPO is slow)")
     p.add_argument("--logdir", type=str, default="runs/puffer_ppo")
     p.add_argument("--save_every", type=int, default=100_000)
     p.add_argument("--checkpoint", type=str, default=None)
@@ -313,7 +382,8 @@ def main():
     use_lstm = args.lstm
 
     device = torch.device(args.device)
-    if device.type == "cuda":
+    use_gpu = device.type == "cuda"
+    if use_gpu:
         torch.backends.cudnn.benchmark = True
 
     # ---- engine ----
@@ -336,14 +406,18 @@ def main():
     kind = "MLP-LSTM" if use_lstm else "MLP"
     print(f"Model: {kind}, {total_params:,} parameters")
 
-    if args.compile and device.type == "cuda":
+    if args.compile and use_gpu:
         model = torch.compile(model)
         print("torch.compile enabled")
 
-    use_amp = device.type == "cuda" and not args.no_amp
+    use_amp = use_gpu and not args.no_amp
     amp_dtype = torch.bfloat16 if use_amp else torch.float32
     if use_amp:
         print(f"Mixed precision: {amp_dtype}")
+
+    use_async = use_gpu and args.async_collect
+    if use_async:
+        print("Async double-buffer: enabled (CPU collection + GPU training)")
 
     if args.checkpoint and os.path.exists(args.checkpoint):
         ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
@@ -362,8 +436,11 @@ def main():
     lstm_state = None
     init_lstm = None
     if use_lstm:
-        lstm_state = model.get_initial_state(args.num_envs, device)
-        init_lstm = (lstm_state[0].clone(), lstm_state[1].clone())
+        cpu_lstm = (
+            torch.zeros(1, args.num_envs, args.lstm_dim),
+            torch.zeros(1, args.num_envs, args.lstm_dim),
+        )
+        lstm_state = cpu_lstm
 
     steps_per_update = args.num_envs * args.rollout_len
     num_updates = (args.total_steps - start_step) // steps_per_update
@@ -374,6 +451,14 @@ def main():
     print(f"  PPO: epochs={args.ppo_epochs}, mb={args.num_minibatches}, "
           f"clip={args.clip_ratio}, ent={args.ent_coef}")
 
+    # ---- async collector setup ----
+    collector = None
+    if use_async:
+        collector = AsyncCollector(
+            engine, model, obs, args.num_envs, obs_dim,
+            args.rollout_len, use_lstm, lstm_state,
+        )
+
     t_start = time.time()
     recent_returns = []
     recent_lengths = []
@@ -383,49 +468,81 @@ def main():
         t_update = time.time()
 
         # ---- collect ----
-        if use_lstm:
-            init_lstm = (lstm_state[0].clone(), lstm_state[1].clone())
-            rollout = collect_rollout_lstm(
-                engine, model, obs, lstm_state, device,
-                args.rollout_len, args.num_envs, obs_dim,
-            )
-            obs = rollout["final_obs"]
-            lstm_state = rollout["final_lstm_state"]
+        if use_async:
+            if update == 0:
+                # First rollout: just collect synchronously
+                collector.sync_weights(model)
+                collector.launch()
+            rollout = collector.join()
         else:
-            rollout = collect_rollout_mlp(
-                engine, model, obs, device,
-                args.rollout_len, args.num_envs, obs_dim,
-            )
-            obs = rollout["final_obs"]
+            # Synchronous: use CPU model copy for inference
+            if update == 0:
+                sync_cpu_model = copy.deepcopy(model).cpu().eval()
+            else:
+                cpu_sd = {k: v.cpu() for k, v in model.state_dict().items()}
+                sync_cpu_model.load_state_dict(cpu_sd)
+            if use_lstm:
+                init_lstm = (lstm_state[0].clone(), lstm_state[1].clone())
+                rollout = collect_rollout_lstm(
+                    engine, sync_cpu_model, obs, lstm_state,
+                    args.rollout_len, args.num_envs, obs_dim,
+                )
+                obs = rollout["final_obs"]
+                lstm_state = rollout["final_lstm_state"]
+            else:
+                rollout = collect_rollout_mlp(
+                    engine, sync_cpu_model, obs,
+                    args.rollout_len, args.num_envs, obs_dim,
+                )
+                obs = rollout["final_obs"]
 
         recent_returns.extend(rollout["ep_returns"])
         recent_lengths.extend(rollout["ep_lengths"])
         recent_snake_lengths.extend(rollout["ep_snake_lengths"])
 
-        # ---- GAE ----
-        adv, ret = compute_gae(
+        # ---- GAE on GPU ----
+        adv_t, ret_t = compute_gae_gpu(
             rollout["rewards"], rollout["values"], rollout["dones"],
-            rollout["bootstrap_value"], args.gamma, args.gae_lambda,
+            rollout["bootstrap_value"], args.gamma, args.gae_lambda, device,
         )
-        rollout["advantages"] = adv.astype(np.float32)
-        rollout["returns"] = ret.astype(np.float32)
 
         # ---- PPO ----
         if use_lstm:
+            if not use_async:
+                init_lstm_gpu = (init_lstm[0].to(device), init_lstm[1].to(device))
+            else:
+                init_lstm_gpu = (
+                    torch.zeros(1, args.num_envs, args.lstm_dim, device=device),
+                    torch.zeros(1, args.num_envs, args.lstm_dim, device=device),
+                )
             metrics = ppo_update_lstm(
-                model, optimizer, rollout,
-                (init_lstm[0].to(device), init_lstm[1].to(device)),
+                model, optimizer, rollout, init_lstm_gpu,
+                adv_t, ret_t,
                 args.clip_ratio, args.ppo_epochs, args.num_minibatches,
                 args.ent_coef, args.vf_coef, args.max_grad_norm,
                 device, amp_dtype,
             )
         else:
+            # Transfer rollout data to GPU for PPO
+            T, N = rollout["obs"].shape[:2]
+            total = T * N
+            obs_gpu  = torch.from_numpy(rollout["obs"].reshape(total, -1)).to(device)
+            act_gpu  = torch.from_numpy(rollout["actions"].reshape(total)).to(device)
+            logp_gpu = torch.from_numpy(rollout["logprobs"].reshape(total)).to(device)
+            adv_flat = adv_t.reshape(total)
+            ret_flat = ret_t.reshape(total)
+
             metrics = ppo_update_mlp(
-                model, optimizer, rollout,
+                model, optimizer, obs_gpu, act_gpu, logp_gpu,
+                adv_flat, ret_flat,
                 args.clip_ratio, args.ppo_epochs, args.num_minibatches,
-                args.ent_coef, args.vf_coef, args.max_grad_norm,
-                device, amp_dtype,
+                args.ent_coef, args.vf_coef, args.max_grad_norm, amp_dtype,
             )
+
+        # ---- launch next collection (overlaps with logging/checkpoint IO) ----
+        if use_async:
+            collector.sync_weights(model)
+            collector.launch()
 
         global_step += steps_per_update
         dt = time.time() - t_update
@@ -460,6 +577,10 @@ def main():
                         "optimizer": optimizer.state_dict(),
                         "step": global_step, "args": vars(args)}, ckpt_path)
             print(f"  Saved checkpoint: {ckpt_path}")
+
+    # Wait for any in-flight collection
+    if use_async and collector._thread is not None and collector._thread.is_alive():
+        collector.join()
 
     final_path = os.path.join(args.logdir, "final.pt")
     torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict(),

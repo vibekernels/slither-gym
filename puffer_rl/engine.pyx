@@ -4,6 +4,7 @@
 import numpy as np
 cimport numpy as cnp
 from libc.math cimport sin, cos, sqrt, atan2, M_PI
+from cython.parallel cimport prange
 
 cnp.import_array()
 
@@ -168,7 +169,7 @@ cdef class VecSlither:
     def reset_all(self):
         """Reset every environment.  Returns initial obs (n_envs, obs_dim)."""
         cdef int e
-        for e in range(self.n_envs):
+        for e in prange(self.n_envs, nogil=True, schedule='static'):
             self._reset_env(e)
             self._compute_obs_env(e)
         return np.asarray(self.obs_buf).copy()
@@ -178,7 +179,7 @@ cdef class VecSlither:
         """Step all envs.  Returns (obs, rewards, dones, ep_returns, ep_lens, ep_snake_lens)."""
         cdef int[::1] act = actions
         cdef int e
-        for e in range(self.n_envs):
+        for e in prange(self.n_envs, nogil=True, schedule='static'):
             self.done_buf[e] = 0
             self.rew_buf[e] = 0.0
             self.ep_ret_buf[e] = 0.0
