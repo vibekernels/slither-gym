@@ -43,21 +43,23 @@ For GPU training, install PyTorch with CUDA (see https://pytorch.org/get-started
 
 ## Training
 
+Use `PYTHONUNBUFFERED=1` so training metrics print in real time:
+
 ```bash
 # RGB CNN (recommended)
-python -m puffer_rl.train --device cuda --compile --rgb --rgb_res 32 \
+PYTHONUNBUFFERED=1 python -m puffer_rl.train --device cuda --compile --rgb --rgb_res 32 \
     --total_steps 30000000 --num_envs 256 --rollout_len 128 \
     --hidden_dim 256 --ent_coef 0.03 --anneal_lr \
     --logdir runs/rgb_cnn
 
 # 5-channel CNN (pre-separated entity channels)
-python -m puffer_rl.train --device cuda --compile --cnn \
+PYTHONUNBUFFERED=1 python -m puffer_rl.train --device cuda --compile --cnn \
     --total_steps 30000000 --num_envs 256 --rollout_len 128 \
     --hidden_dim 256 --ent_coef 0.03 --anneal_lr \
     --logdir runs/spatial_cnn
 
 # MLP baseline (vector observations)
-python -m puffer_rl.train --device cuda --compile \
+PYTHONUNBUFFERED=1 python -m puffer_rl.train --device cuda --compile \
     --total_steps 5000000 --num_envs 256 --rollout_len 128 \
     --logdir runs/mlp_baseline
 ```
