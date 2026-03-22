@@ -501,6 +501,10 @@ def parse_args():
     p.add_argument("--lstm_dim", type=int, default=128)
     p.add_argument("--cnn", action="store_true",
                    help="Use CNN with spatial ego-centric grid obs")
+    p.add_argument("--rgb", action="store_true",
+                   help="Use CNN with RGB ego-centric rendering")
+    p.add_argument("--rgb_res", type=int, default=32,
+                   help="RGB observation resolution (default 32)")
     p.add_argument("--anneal_lr", action="store_true",
                    help="Linear LR annealing to 0")
     p.add_argument("--device", type=str, default="cpu")
@@ -519,7 +523,7 @@ def main():
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     use_lstm = args.lstm
-    use_cnn = args.cnn
+    use_cnn = args.cnn or args.rgb
 
     device = torch.device(args.device)
     use_gpu = device.type == "cuda"
@@ -527,22 +531,36 @@ def main():
         torch.backends.cudnn.benchmark = True
 
     # ---- engine ----
-    engine = VecSlither(n_envs=args.num_envs, seed=args.seed,
-                        spatial_obs=use_cnn)
+    if args.rgb:
+        engine = VecSlither(n_envs=args.num_envs, seed=args.seed,
+                            rgb_obs=True, rgb_h=args.rgb_res, rgb_w=args.rgb_res)
+        spatial_c = 3
+        spatial_h = args.rgb_res
+        spatial_w = args.rgb_res
+    elif args.cnn:
+        engine = VecSlither(n_envs=args.num_envs, seed=args.seed,
+                            spatial_obs=True)
+        spatial_c = 5
+        spatial_h = 32
+        spatial_w = 32
+    else:
+        engine = VecSlither(n_envs=args.num_envs, seed=args.seed)
     obs_dim = engine.obs_dim
     act_dim = 6
     frame_stack_k = args.frame_stack if not (use_lstm or use_cnn) else 1
     model_input_dim = obs_dim * frame_stack_k
     print(f"Engine: {args.num_envs} envs, obs_dim={obs_dim}")
-    if use_cnn:
+    if args.rgb:
+        print(f"RGB obs: ({3}, {args.rgb_res}, {args.rgb_res}) + 3 scalars")
+    elif args.cnn:
         print(f"Spatial obs: ({5}, 32, 32) + 3 scalars")
     elif frame_stack_k > 1:
         print(f"Frame stacking: {frame_stack_k} frames → {model_input_dim}-dim input")
 
     # ---- model ----
     if use_cnn:
-        model = CNNPolicy(spatial_channels=5, spatial_h=32, spatial_w=32,
-                          scalar_dim=3, act_dim=act_dim,
+        model = CNNPolicy(spatial_channels=spatial_c, spatial_h=spatial_h,
+                          spatial_w=spatial_w, scalar_dim=3, act_dim=act_dim,
                           hidden_dim=args.hidden_dim).to(device)
     elif use_lstm:
         model = MLPLSTMPolicy(obs_dim=obs_dim, act_dim=act_dim,
@@ -554,7 +572,7 @@ def main():
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, eps=1e-5)
 
     total_params = sum(p.numel() for p in model.parameters())
-    kind = "CNN" if use_cnn else ("MLP-LSTM" if use_lstm else "MLP")
+    kind = ("RGB-CNN" if args.rgb else "CNN") if use_cnn else ("MLP-LSTM" if use_lstm else "MLP")
     print(f"Model: {kind}, {total_params:,} parameters, hidden={args.hidden_dim}")
 
     if args.compile and use_gpu:
