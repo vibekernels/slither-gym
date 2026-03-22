@@ -73,8 +73,11 @@ cdef class VecSlither:
     # Output buffers
     cdef float[:,::1] obs_buf
     cdef float[:,:,:,::1] spatial_buf   # (n_envs, SPATIAL_C, H, W)
+    cdef float[:,:,:,::1] rgb_buf       # (n_envs, 3, H, W)
     cdef float[:,::1] scalar_buf        # (n_envs, SPATIAL_SCALAR)
     cdef int use_spatial
+    cdef int use_rgb
+    cdef int rgb_h, rgb_w
     cdef float[::1] rew_buf
     cdef cnp.uint8_t[::1] done_buf
 
@@ -92,10 +95,14 @@ cdef class VecSlither:
                  double food_reward=1.5, double kill_reward=10.0,
                  double death_scale=0.1, double survival_bonus=-0.005,
                  double boost_cost=-0.01,
-                 bint spatial_obs=False):
+                 bint spatial_obs=False,
+                 bint rgb_obs=False, int rgb_h=32, int rgb_w=32):
         self.n_envs = n_envs
         self.obs_dim = OBS_DIM_VAL
         self.use_spatial = spatial_obs
+        self.use_rgb = rgb_obs
+        self.rgb_h = rgb_h
+        self.rgb_w = rgb_w
 
         # Config
         self.arena_radius = 1000.0
@@ -157,6 +164,9 @@ cdef class VecSlither:
             self.spatial_buf = np.zeros((n_envs, SPATIAL_C, SPATIAL_H, SPATIAL_W),
                                        dtype=np.float32)
             self.scalar_buf  = np.zeros((n_envs, SPATIAL_SCALAR), dtype=np.float32)
+        if rgb_obs:
+            self.rgb_buf = np.zeros((n_envs, 3, rgb_h, rgb_w), dtype=np.float32)
+            self.scalar_buf = np.zeros((n_envs, SPATIAL_SCALAR), dtype=np.float32)
         self.rew_buf  = np.zeros(n_envs, dtype=np.float32)
         self.done_buf = np.zeros(n_envs, dtype=np.uint8)
 
@@ -187,6 +197,11 @@ cdef class VecSlither:
             self._compute_obs_env(e)
             if self.use_spatial:
                 self._compute_spatial_obs_env(e)
+            if self.use_rgb:
+                self._compute_rgb_obs_env(e)
+        if self.use_rgb:
+            return (np.asarray(self.rgb_buf).copy(),
+                    np.asarray(self.scalar_buf).copy())
         if self.use_spatial:
             return (np.asarray(self.spatial_buf).copy(),
                     np.asarray(self.scalar_buf).copy())
@@ -207,6 +222,16 @@ cdef class VecSlither:
             self._compute_obs_env(e)
             if self.use_spatial:
                 self._compute_spatial_obs_env(e)
+            if self.use_rgb:
+                self._compute_rgb_obs_env(e)
+        if self.use_rgb:
+            return (np.asarray(self.rgb_buf),
+                    np.asarray(self.scalar_buf),
+                    np.asarray(self.rew_buf),
+                    np.asarray(self.done_buf),
+                    np.asarray(self.ep_ret_buf),
+                    np.asarray(self.ep_len_buf),
+                    np.asarray(self.ep_slen_buf))
         if self.use_spatial:
             return (np.asarray(self.spatial_buf),
                     np.asarray(self.scalar_buf),
@@ -769,6 +794,112 @@ cdef class VecSlither:
                 gc = <int>(ego_y * inv_cell + half_w)
                 if 0 <= gr < SPATIAL_H and 0 <= gc < SPATIAL_W:
                     self.spatial_buf[e, 2, gr, gc] = 1.0
+
+        # --- Scalar features ---
+        self.scalar_buf[e, 0] = <float>(<double>self.plength[e] / <double>MAX_SEG)
+        self.scalar_buf[e, 1] = <float>self.pboosting[e]
+        self.scalar_buf[e, 2] = <float>(sqrt(self.px[e]*self.px[e] + self.py[e]*self.py[e])
+                                        / self.arena_radius)
+
+    # ------------------------------------------------- RGB observation
+    cdef void _compute_rgb_obs_env(self, int e) noexcept nogil:
+        """Render ego-centric RGB grid: (3, rgb_h, rgb_w).
+
+        Colors (R, G, B) as float [0, 1]:
+          background = black (0, 0, 0)
+          food       = green (0.2, 0.9, 0.2)
+          own body   = blue  (0.2, 0.4, 1.0)
+          own head   = white (1.0, 1.0, 1.0)
+          npc body   = red   (1.0, 0.2, 0.2)
+          boundary   = gray  (0.4, 0.4, 0.4)
+        """
+        cdef double cd = cos(self.pdir[e])
+        cdef double sd = sin(self.pdir[e])
+        cdef double vp = self.viewport
+        cdef int H = self.rgb_h
+        cdef int W = self.rgb_w
+        cdef double cell_size = (2.0 * vp) / <double>W
+        cdef double inv_cell = 1.0 / cell_size
+        cdef int r, c, i, k, seg_idx, nidx
+        cdef double dx, dy, ego_x, ego_y, wx, wy, dist_sq
+        cdef int gr, gc
+        cdef double half_h = <double>H * 0.5
+        cdef double half_w = <double>W * 0.5
+        cdef double ar_sq = self.arena_radius * self.arena_radius
+
+        # Clear to black
+        for c in range(3):
+            for r in range(H):
+                for gc in range(W):
+                    self.rgb_buf[e, c, r, gc] = 0.0
+
+        # --- Boundary (gray) ---
+        for r in range(H):
+            for gc in range(W):
+                ego_x = (<double>r - half_h + 0.5) * cell_size
+                ego_y = (<double>gc - half_w + 0.5) * cell_size
+                wx = self.px[e] + cd * ego_x - sd * ego_y
+                wy = self.py[e] + sd * ego_x + cd * ego_y
+                dist_sq = wx * wx + wy * wy
+                if dist_sq > ar_sq:
+                    self.rgb_buf[e, 0, r, gc] = 0.4
+                    self.rgb_buf[e, 1, r, gc] = 0.4
+                    self.rgb_buf[e, 2, r, gc] = 0.4
+
+        # --- Food (green) ---
+        for i in range(MAX_FOOD):
+            if not self.factive[e, i]:
+                continue
+            dx = self.fx[e, i] - self.px[e]
+            dy = self.fy[e, i] - self.py[e]
+            ego_x =  cd * dx + sd * dy
+            ego_y = -sd * dx + cd * dy
+            gr = <int>(ego_x * inv_cell + half_h)
+            gc = <int>(ego_y * inv_cell + half_w)
+            if 0 <= gr < H and 0 <= gc < W:
+                self.rgb_buf[e, 0, gr, gc] = 0.2
+                self.rgb_buf[e, 1, gr, gc] = 0.9
+                self.rgb_buf[e, 2, gr, gc] = 0.2
+
+        # --- Own body (blue) ---
+        for k in range(self.plength[e]):
+            seg_idx = (self.pseg_head[e] - k + MAX_SEG) % MAX_SEG
+            dx = self.pseg_x[e, seg_idx] - self.px[e]
+            dy = self.pseg_y[e, seg_idx] - self.py[e]
+            ego_x =  cd * dx + sd * dy
+            ego_y = -sd * dx + cd * dy
+            gr = <int>(ego_x * inv_cell + half_h)
+            gc = <int>(ego_y * inv_cell + half_w)
+            if 0 <= gr < H and 0 <= gc < W:
+                self.rgb_buf[e, 0, gr, gc] = 0.2
+                self.rgb_buf[e, 1, gr, gc] = 0.4
+                self.rgb_buf[e, 2, gr, gc] = 1.0
+
+        # --- Own head (white) ---
+        gr = H // 2
+        gc = W // 2
+        self.rgb_buf[e, 0, gr, gc] = 1.0
+        self.rgb_buf[e, 1, gr, gc] = 1.0
+        self.rgb_buf[e, 2, gr, gc] = 1.0
+
+        # --- NPC body (red) ---
+        cdef int npc_base = e * NUM_NPCS
+        for i in range(NUM_NPCS):
+            nidx = npc_base + i
+            if not self.nalive[nidx]:
+                continue
+            for k in range(self.nlength[nidx]):
+                seg_idx = (self.nseg_head[nidx] - k + MAX_SEG) % MAX_SEG
+                dx = self.nseg_x[nidx, seg_idx] - self.px[e]
+                dy = self.nseg_y[nidx, seg_idx] - self.py[e]
+                ego_x =  cd * dx + sd * dy
+                ego_y = -sd * dx + cd * dy
+                gr = <int>(ego_x * inv_cell + half_h)
+                gc = <int>(ego_y * inv_cell + half_w)
+                if 0 <= gr < H and 0 <= gc < W:
+                    self.rgb_buf[e, 0, gr, gc] = 1.0
+                    self.rgb_buf[e, 1, gr, gc] = 0.2
+                    self.rgb_buf[e, 2, gr, gc] = 0.2
 
         # --- Scalar features ---
         self.scalar_buf[e, 0] = <float>(<double>self.plength[e] / <double>MAX_SEG)
